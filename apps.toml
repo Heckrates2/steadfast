@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# Steadfast: Anwendungs-Konfiguration
+#
+# Jede [apps.<app_id>] Sektion definiert eine isolierte REST-API.
+# Endpunkte mit auth_required = true verlangen den Header
+#   X-API-Key: <api_key_secret der App>
+# und erhaelt in der Business-Logik die User-Metadaten aus den Headern
+#   X-User-Id / X-User-Role (MVP: Gateway-Pattern, spaeter aus JWT-Claims).
+# ---------------------------------------------------------------------------
+
+[apps.todo_app]
+# Demo-Direct-Input. Fuer echte Deployments: Secret per Umgebungsvariable
+# uebergeben, statt es im Klartext abzulegen (mind. 16 Zeichen):
+#   api_key_secret = "${TODO_APP_SECRET}"
+#   (Windows: set TODO_APP_SECRET=...  |  Linux: export TODO_APP_SECRET=...)
+api_key_secret = "super_geheimes_todo_salt_123"
+
+  [apps.todo_app.endpoints.tasks_get]
+  path = "/tasks"
+  method = "GET"
+  auth_required = false
+  paging_default = 20
+
+  [apps.todo_app.endpoints.tasks_create]
+  path = "/tasks"
+  method = "POST"
+  auth_required = true
+
+  business_logic = """
+  fn on_request(payload, user) {
+      if user.role != "premium" && payload.is_priority == true {
+          throw "Nur Premium-Nutzer koennen Prioritaets-Tasks erstellen!";
+      }
+      if payload.title.len() == 0 {
+          throw "Titel darf nicht leer sein.";
+      }
+      payload.created_by = user.id;
+      payload.status = "offen";
+      return payload;
+  }
+  """
+
+  # --- Demo-Erweiterung: vollstaendiges CRUD ueber dieselbe Kollektion ---
+
+  [apps.todo_app.endpoints.tasks_replace]
+  path = "/tasks"
+  method = "PUT"
+  auth_required = true
+
+  [apps.todo_app.endpoints.tasks_patch]
+  path = "/tasks"
+  method = "PATCH"
+  auth_required = true
+
+  [apps.todo_app.endpoints.tasks_delete]
+  path = "/tasks"
+  method = "DELETE"
+  auth_required = true

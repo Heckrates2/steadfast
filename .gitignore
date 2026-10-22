@@ -1,0 +1,16 @@
+# Build-Artefakte
+/target
+
+# Lokale Editor-/Agent-Sitzungsdaten
+.zcode/
+
+# Logs und Datenverzeichnisse gehoeren nie ins Repo (M5)
+*.log
+data*/
+
+# Produktive/betriebliche Konfigurationen (koennen Secrets oder Kundendaten
+# enthalten) — Vorlage fuer neue Apps: apps.toml.example
+finanz.toml
+
+# Bench-Konfiguration perf.toml bleibt bewusst getrackt (README-Referenz,
+# enthaelt weder Secrets noch Daten).

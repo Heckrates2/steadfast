@@ -1,0 +1,27 @@
+# ---------------------------------------------------------------------------
+# Bench-App fuer Lasttests der Listen-Pfade (perf.toml).
+#
+# Bewusst ohne Auth und ohne Skript: Der Messlauf soll den reinen
+# Store-/HTTP-Pfad sehen, nicht Kryptografie oder Rhai. `filter_fields`
+# deklariert die Sekundaerindizes (Union je Kollektions-Pfad) und erlaubt
+# Gleichheits-/Bereichs-Filter sowie Sortierung auf genau diesen Feldern.
+#
+# Start (ohne --data-dir, damit der Messlauf rein im RAM bleibt):
+#   target\release\steadfast.exe perf.toml 127.0.0.1:8081
+#
+# Seeden (5000 Dokumente, 5 Batches mit je fester grp/summe-Kombination):
+#   loadtest --url .../perf_app/items --requests 1000 --method POST
+#            --body "{\"grp\":\"g0\",\"flag\":true,\"summe\":10,\"titel\":\"doc g0\"}"
+# ---------------------------------------------------------------------------
+
+[apps.perf_app]
+
+  [apps.perf_app.endpoints.items_get]
+  path = "/items"
+  method = "GET"
+  paging_default = 20
+  filter_fields = ["grp", "flag", "summe", "titel"]
+
+  [apps.perf_app.endpoints.items_post]
+  path = "/items"
+  method = "POST"

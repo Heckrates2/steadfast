@@ -1,0 +1,36 @@
+[package]
+name = "steadfast-server"
+description = "Monolith-Binary der REST-Engine (Axum, Hot Path)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Produkt-Binary heisst kurz `steadfast` (steadfast apps.toml 127.0.0.1:8080).
+[[bin]]
+name = "steadfast"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+steadfast-core = { workspace = true }
+steadfast-storage = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+subtle = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Direkte Deps nur fuer das `loadtest`-Binary (HTTP-Client mit Keep-Alive-Pool);
+# im Server-Binary selbst unbenutzt.
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

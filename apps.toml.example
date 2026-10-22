@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# Steadfast: Vorlage fuer die Anwendungs-Konfiguration.
+#
+# Kopieren nach apps.toml (oder einem beliebigen Namen, als erstes
+# Positionsargument uebergeben) und die Werte an die eigene App anpassen.
+#
+# Secrets gehoeren NICHT in die Datei: `${ENV_VAR}`-Indirection liest den
+# Wert beim Start aus der Umgebungsvariable (Fail-Fast, wenn die Variable
+# fehlt oder leer ist; Mindestlaenge 16 Zeichen):
+#   Windows:  set TODO_APP_SECRET=...
+#   Linux:    export TODO_APP_SECRET=...
+# ---------------------------------------------------------------------------
+
+[apps.todo_app]
+api_key_secret = "${TODO_APP_SECRET}"
+
+  [apps.todo_app.endpoints.tasks_get]
+  path = "/tasks"
+  method = "GET"
+  auth_required = false
+  paging_default = 20
+
+  [apps.todo_app.endpoints.tasks_create]
+  path = "/tasks"
+  method = "POST"
+  auth_required = true
+
+  business_logic = """
+  fn on_request(payload, user) {
+      if user.role != "premium" && payload.is_priority == true {
+          throw "Nur Premium-Nutzer koennen Prioritaets-Tasks erstellen!";
+      }
+      if payload.title.len() == 0 {
+          throw "Titel darf nicht leer sein.";
+      }
+      payload.created_by = user.id;
+      payload.status = "offen";
+      return payload;
+  }
+  """
+
+  [apps.todo_app.endpoints.tasks_replace]
+  path = "/tasks"
+  method = "PUT"
+  auth_required = true
+
+  [apps.todo_app.endpoints.tasks_patch]
+  path = "/tasks"
+  method = "PATCH"
+  auth_required = true
+
+  [apps.todo_app.endpoints.tasks_delete]
+  path = "/tasks"
+  method = "DELETE"
+  auth_required = true
