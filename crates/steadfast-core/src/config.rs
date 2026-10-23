@@ -9,6 +9,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::error::EngineError;
+use crate::schema::{EndpointSchema, FieldType};
 use crate::script::{CompiledScript, ScriptRuntime};
 
 /// Default-Seitengroesse, wenn ein Endpunkt kein `paging_default` setzt.
@@ -117,6 +118,22 @@ struct EndpointRaw {
     paging_default: Option<usize>,
     filter_fields: Option<Vec<String>>,
     business_logic: Option<String>,
+    #[serde(default)]
+    schema: Option<SchemaRaw>,
+}
+
+/// Rohe `[endpoint.schema]`-Sektion. `deny_unknown_fields` macht Tippfehler
+/// (`requred = [...]`) zu Startfehlern, statt Validierung stillschweigend
+/// zu überspringen — die Sektion verspricht Pruefungen, die dann kommen.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaRaw {
+    #[serde(default)]
+    required: Vec<String>,
+    #[serde(default)]
+    allow_unknown_fields: bool,
+    #[serde(default)]
+    types: HashMap<String, String>,
 }
 
 // --- Runtime-Strukturen (fertig validiert + kompiliert) ----------------------
@@ -135,6 +152,9 @@ pub struct EndpointRuntime {
     pub paging_default: usize,
     /// Optionale Allowlist filterbarer Felder.
     pub filter_fields: Option<Arc<[String]>>,
+    /// Vorkompiliertes Schema fuer Mutationen (POST/PUT/PATCH). `None` = keine
+    /// Validierung konfiguriert — der Hot Path bleibt dann unangetastet.
+    pub schema: Option<Arc<EndpointSchema>>,
     pub script: Option<Arc<CompiledScript>>,
 }
 
@@ -329,6 +349,31 @@ fn validate_and_compile(
                 )));
             }
 
+            // Schema-Validierung ist nur fuer Body-tragende Mutationen
+            // sinnvoll; auf GET/DELETE waere sie toter Config-Code —
+            // lieber laut abweisen, als ein falsches Sicherheitsgefuehl
+            // zu erzeugen.
+            let schema = match &raw_ep.schema {
+                None => None,
+                Some(raw_schema) => {
+                    if !matches!(
+                        method,
+                        HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch
+                    ) {
+                        return Err(EngineError::Config(format!(
+                            "app `{app_id}`, endpoint `{endpoint_name}`: schema is only \
+                             supported on POST, PUT and PATCH ({} has no request body)",
+                            method.as_str()
+                        )));
+                    }
+                    Some(Arc::new(compile_schema(
+                        &app_id,
+                        &endpoint_name,
+                        raw_schema,
+                    )?))
+                }
+            };
+
             if raw_ep.auth_required && secret.is_none() {
                 return Err(EngineError::Config(format!(
                     "app `{app_id}`, endpoint `{endpoint_name}`: auth_required = true \
@@ -388,6 +433,7 @@ fn validate_and_compile(
                     auth_required: raw_ep.auth_required,
                     paging_default,
                     filter_fields,
+                    schema,
                     script,
                 }),
             );
@@ -438,6 +484,50 @@ fn resolve_api_key_secret(
              export it before starting the engine"
         ))),
     }
+}
+
+// --- Schema-Validierung --------------------------------------------------------
+
+/// Uebersetzt die rohe `[schema]`-Sektion in das vorkompilierte
+/// [`EndpointSchema`]. Alle Fehler sind Config-Fehler (Fail-Fast beim
+/// Start): unbekannte Typ-Strings, ungueltige Feldnamen.
+fn compile_schema(
+    app_id: &str,
+    endpoint_name: &str,
+    raw: &SchemaRaw,
+) -> Result<EndpointSchema, EngineError> {
+    let context = format!("app `{app_id}`, endpoint `{endpoint_name}`: schema");
+
+    let mut types = HashMap::with_capacity(raw.types.len());
+    for (field, type_str) in &raw.types {
+        validate_field_name(field).map_err(|reason| {
+            EngineError::Config(format!(
+                "{context}: invalid field `{field}` in `schema.types`: {reason}"
+            ))
+        })?;
+        let field_type = FieldType::parse(type_str).ok_or_else(|| {
+            EngineError::Config(format!(
+                "{context}: unknown type `{type_str}` for field `{field}` \
+                 (allowed: \"string\", \"number\", \"boolean\", \"object\", \"array\", \"null\", \
+                 \"date\" (YYYY-MM-DD), \"datetime\" (RFC 3339 mit Offset))"
+            ))
+        })?;
+        types.insert(field.clone(), field_type);
+    }
+
+    for field in &raw.required {
+        validate_field_name(field).map_err(|reason| {
+            EngineError::Config(format!(
+                "{context}: invalid field `{field}` in `schema.required`: {reason}"
+            ))
+        })?;
+    }
+
+    Ok(EndpointSchema::new(
+        raw.required.clone(),
+        types,
+        raw.allow_unknown_fields,
+    ))
 }
 
 // --- CORS-Validierung ---------------------------------------------------------
@@ -1024,6 +1114,235 @@ api_key_secret = "pa$$w0rd-${not_a_var}"
             EngineConfig::from_toml(src),
             Err(EngineError::Config(_))
         ));
+    }
+
+    // --- Schema ----------------------------------------------------------------
+
+    #[test]
+    fn schema_section_precompiles_into_runtime() {
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.create]
+  path = "/tasks"
+  method = "POST"
+
+    [apps.a.endpoints.create.schema]
+    required = ["title", "grp"]
+    allow_unknown_fields = true
+
+      [apps.a.endpoints.create.schema.types]
+      title = "string"
+      grp = "string"
+      summe = "number"
+      is_priority = "boolean"
+"#;
+        let config = EngineConfig::from_toml(src).expect("schema config must load");
+        let ep = config.apps["a"].endpoints["create"].clone();
+        let schema = ep.schema.as_ref().expect("schema must be precompiled");
+        assert_eq!(schema.required().len(), 2);
+        assert!(schema.required().contains("title"));
+        assert_eq!(schema.types().len(), 4);
+        assert_eq!(schema.types()["summe"], FieldType::Number);
+        assert!(schema.allow_unknown_fields());
+
+        // Vorlauf-Verhalten: gültiges Dokument passiert, Verstoß sammelt
+        // alle Details (Detailqualitaet testet EndpointSchema selbst — hier
+        // nur der Durchlauf durch die Config).
+        assert_eq!(
+            schema.validate(&serde_json::json!({"title": "x", "grp": "g"}), false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn schema_defaults_to_strict_and_no_required() {
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.create]
+  path = "/tasks"
+  method = "POST"
+
+    [apps.a.endpoints.create.schema]
+    types = { summe = "number" }
+"#;
+        let config = EngineConfig::from_toml(src).unwrap();
+        let schema = config.apps["a"].endpoints["create"]
+            .schema
+            .as_ref()
+            .expect("schema");
+        assert!(!schema.allow_unknown_fields(), "Default ist strikt");
+        assert!(schema.required().is_empty());
+    }
+
+    #[test]
+    fn date_and_datetime_types_compile_at_startup() {
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.create]
+  path = "/events"
+  method = "POST"
+
+    [apps.a.endpoints.create.schema]
+    required = ["title", "starts_at"]
+    allow_unknown_fields = true
+
+      [apps.a.endpoints.create.schema.types]
+      title = "string"
+      starts_at = "datetime"
+      birthday = "date"
+"#;
+        let config = EngineConfig::from_toml(src).unwrap();
+        let schema = config.apps["a"].endpoints["create"]
+            .schema
+            .as_ref()
+            .expect("schema");
+        assert_eq!(
+            schema.types().get("starts_at").map(FieldType::as_str),
+            Some("datetime")
+        );
+        assert_eq!(
+            schema.types().get("birthday").map(FieldType::as_str),
+            Some("date")
+        );
+        // Und die Formatpruefung greift aus dem kompilierten Schema heraus.
+        assert_eq!(
+            schema.validate(
+                &serde_json::json!({
+                    "title": "Release",
+                    "starts_at": "2026-11-05T09:00:00Z",
+                    "birthday": "1990-07-14"
+                }),
+                false
+            ),
+            Ok(())
+        );
+        assert!(
+            schema
+                .validate(
+                    &serde_json::json!({
+                        "title": "Release",
+                        "starts_at": "05.11.2026 09:00",
+                        "birthday": "1990-07-14"
+                    }),
+                    false
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_schema_type_fails_at_startup() {
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.create]
+  path = "/tasks"
+  method = "POST"
+
+    [apps.a.endpoints.create.schema]
+    types = { summe = "integer" }
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(
+            err.message().contains("unknown type `integer`") && err.message().contains("allowed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn schema_with_invalid_field_name_fails_at_startup() {
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.create]
+  path = "/tasks"
+  method = "POST"
+
+    [apps.a.endpoints.create.schema]
+    required = ["title", "bad field!"]
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(
+            err.message().contains("schema.required") && err.message().contains("bad field!"),
+            "{err}"
+        );
+
+        let src = src.replace(
+            "required = [\"title\", \"bad field!\"]",
+            "types = { \"bad key!\" = \"string\" }",
+        );
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("schema.types"), "{err}");
+    }
+
+    #[test]
+    fn schema_on_get_endpoint_is_rejected() {
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.list]
+  path = "/tasks"
+  method = "GET"
+
+    [apps.a.endpoints.list.schema]
+    required = ["title"]
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(
+            err.message()
+                .contains("only supported on POST, PUT and PATCH"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn schema_typo_is_not_silently_ignored() {
+        // deny_unknown_fields: `requred` statt `required` muss den Start
+        // abbrechen, nicht eine Schema-lose Strecke freischalten.
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.create]
+  path = "/tasks"
+  method = "POST"
+
+    [apps.a.endpoints.create.schema]
+    requred = ["title"]
+"#;
+        assert!(matches!(
+            EngineConfig::from_toml(src),
+            Err(EngineError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn schema_on_all_mutation_methods_is_accepted() {
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.post_ep]
+  path = "/tasks"
+  method = "POST"
+  [apps.a.endpoints.post_ep.schema]
+  required = ["title"]
+  [apps.a.endpoints.put_ep]
+  path = "/tasks"
+  method = "PUT"
+  [apps.a.endpoints.put_ep.schema]
+  required = ["title"]
+  [apps.a.endpoints.patch_ep]
+  path = "/tasks"
+  method = "PATCH"
+  [apps.a.endpoints.patch_ep.schema]
+  types = { status = "string" }
+"#;
+        let config = EngineConfig::from_toml(src).expect("mutations accept schema");
+        assert!(config.apps["a"].endpoints["post_ep"].schema.is_some());
+        assert!(config.apps["a"].endpoints["put_ep"].schema.is_some());
+        assert!(config.apps["a"].endpoints["patch_ep"].schema.is_some());
+    }
+
+    #[test]
+    fn endpoints_without_schema_stay_schema_free() {
+        let config = EngineConfig::from_toml(BLUEPRINT_TOML).expect("blueprint");
+        for ep in config.apps["todo_app"].endpoints.values() {
+            assert!(ep.schema.is_none(), "{}", ep.name);
+        }
     }
 
     // --- CORS ------------------------------------------------------------------

@@ -14,6 +14,22 @@
 [apps.todo_app]
 api_key_secret = "${TODO_APP_SECRET}"
 
+  # --- CORS -----------------------------------------------------------------
+  # Ohne [cors]-Sektion schickt die Engine keine Access-Control-*Header und
+  # Browser-Frontends blockieren die Antworten (CORS-Fehler).
+  # allowed_origins = exakte Origins (case-insensitive) oder genau ["*"];
+  # `*` ist nicht mit allow_credentials kombinierbar (Fail-Fast beim Start).
+  # Der Server beantwortet OPTIONS-Preflights selbst (204) und dekoriert
+  # echte Antworten mit Allow-Origin; Requests fremder Origins enden mit 403.
+  [apps.todo_app.cors]
+  allowed_origins = ["http://localhost:3000", "https://todo.example.com"]
+  # Optional — Defaults, falls weggelassen:
+  #   allowed_methods  = alle unterstuetzten (GET, POST, PUT, PATCH, DELETE)
+  #   allowed_headers  = ["content-type", "x-api-key", "x-user-id", "x-user-role"]
+  #   exposed_headers  = ["location"] (Response-Header, die Browser-JS lesen darf)
+  #   allow_credentials = false
+  #   max_age_secs     = kein Access-Control-Max-Age-Header
+
   [apps.todo_app.endpoints.tasks_get]
   path = "/tasks"
   method = "GET"
@@ -38,6 +54,27 @@ api_key_secret = "${TODO_APP_SECRET}"
       return payload;
   }
   """
+
+  # --- Schema-Validierung (optional, nur POST/PUT/PATCH) --------------------
+  # Wird beim Start vorkompiliert und VOR dem Skript geprueft: fehlende
+  # Pflichtfelder oder Typverstoesse kommen als 400 mit
+  # `error.code = "validation_failed"` zurueck, bevor Daten entstehen.
+  #   required             — Pflichtfelder (bei PATCH ohne Pflicht-Check)
+  #   allow_unknown_fields — false (Default) = strikt, undeklarierte Felder abweisen
+  #   types                — Typ pro Feld: "string" | "number" | "boolean" |
+  #                          "object" | "array" | "null" |
+  #                          "date" (YYYY-MM-DD, inkl. Schaltjahre) |
+  #                          "datetime" (RFC 3339, Offset/Z ist Pflicht)
+  # Ungueltige Typ-Strings oder Feldnamen brechen den Start ab (Fail-Fast).
+  # Hinweis: der Schema-Block steht bewusst NACH business_logic — alles nach
+  # einer [section] gehoert dieser Sektion.
+  [apps.todo_app.endpoints.tasks_create.schema]
+  required = ["title"]
+  allow_unknown_fields = true
+
+    [apps.todo_app.endpoints.tasks_create.schema.types]
+    title = "string"
+    is_priority = "boolean"
 
   [apps.todo_app.endpoints.tasks_replace]
   path = "/tasks"

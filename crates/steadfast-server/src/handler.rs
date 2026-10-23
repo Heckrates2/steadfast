@@ -449,6 +449,14 @@ fn post_create(
         Ok(doc) => doc,
         Err(response) => return *response,
     };
+    // Schema-Validierung vor Skript und Store (Fail-Fast): ungueltige
+    // Payloads kosten nur den Parse, nicht die Sandbox und nicht den
+    // Schreib-Mutex der Kollektion. Vollmodus: required wird geprueft.
+    if let Some(schema) = &endpoint.schema {
+        if let Err(details) = schema.validate(&doc, false) {
+            return validation_failed_response(&details);
+        }
+    }
     let mut doc = match run_script(endpoint, doc, user) {
         Ok(doc) => doc,
         Err(response) => return *response,
@@ -508,6 +516,13 @@ fn put_replace(
         Ok(doc) => doc,
         Err(response) => return *response,
     };
+    // PUT ersetzt vollstaendig — required wird wie bei POST geprueft, bevor
+    // Skript laeuft oder der Store gesperrt wird.
+    if let Some(schema) = &endpoint.schema {
+        if let Err(details) = schema.validate(&doc, false) {
+            return validation_failed_response(&details);
+        }
+    }
     let doc = match run_script(endpoint, doc, user) {
         Ok(doc) => doc,
         Err(response) => return *response,
@@ -531,6 +546,16 @@ fn patch_merge(
         Ok(doc) => doc,
         Err(response) => return *response,
     };
+    // Patch-Semantik (partial = true): fehlende required-Felder sind kein
+    // Fehler — der Rest kommt aus dem Bestand. Typ- und Unknown-Field-
+    // Regeln gelten weiterhin fuer jeden uebergebenen Wert. Die Pruefung
+    // laeuft vor `patch_merge` und damit VOR dem Schreib-Mutex: Ein
+    // typfremder Patch kostet keine Sperre und aendert nichts am Bestand.
+    if let Some(schema) = &endpoint.schema {
+        if let Err(details) = schema.validate(&patch, true) {
+            return validation_failed_response(&details);
+        }
+    }
     // N4: Merge + Skript laufen IM Store unter dem per-Kollektion-Schreib-
     // Mutex — zwei gleichzeitige PATCHes auf dasselbe Dokument koennen sich
     // nicht mehr gegenseitig ueberschreiben (kein lost update zwischen get
@@ -613,6 +638,24 @@ pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response
     json_response(
         status,
         &json!({ "error": { "code": code, "message": message } }),
+    )
+}
+
+/// 400 mit den sortierten Schema-Verletzungen. Die Details sind reine
+/// Diagnosen der Client-Payload (Feldname + Regel) und duerfen an den
+/// Client durchgereicht werden — es leakt keine Engine-Interna. Das
+/// geschachtelte `error.code`-Format entspricht allen anderen
+/// Engine-Fehlern; `details` traegt die pro-Feld-Meldungen.
+fn validation_failed_response(details: &[String]) -> Response {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        &json!({
+            "error": {
+                "code": "validation_failed",
+                "message": "payload failed schema validation",
+                "details": details,
+            }
+        }),
     )
 }
 
@@ -751,6 +794,75 @@ api_key_secret = "gallery_secret_456"
       return payload;
   }
   """
+
+[apps.form_app]
+
+  [apps.form_app.endpoints.contacts_get]
+  path = "/contacts"
+  method = "GET"
+
+  [apps.form_app.endpoints.contacts_create]
+  path = "/contacts"
+  method = "POST"
+
+    [apps.form_app.endpoints.contacts_create.schema]
+    required = ["name", "grp"]
+    allow_unknown_fields = true
+
+      [apps.form_app.endpoints.contacts_create.schema.types]
+      name = "string"
+      grp = "string"
+      summe = "number"
+      is_priority = "boolean"
+
+  [apps.form_app.endpoints.contacts_replace]
+  path = "/contacts"
+  method = "PUT"
+
+    [apps.form_app.endpoints.contacts_replace.schema]
+    required = ["name", "grp"]
+    allow_unknown_fields = true
+
+      [apps.form_app.endpoints.contacts_replace.schema.types]
+      name = "string"
+      grp = "string"
+
+  [apps.form_app.endpoints.contacts_patch]
+  path = "/contacts"
+  method = "PATCH"
+
+    [apps.form_app.endpoints.contacts_patch.schema]
+    allow_unknown_fields = true
+
+      [apps.form_app.endpoints.contacts_patch.schema.types]
+      summe = "number"
+      name = "string"
+
+  [apps.form_app.endpoints.strict_create]
+  path = "/strict"
+  method = "POST"
+
+    [apps.form_app.endpoints.strict_create.schema]
+    required = ["name"]
+    allow_unknown_fields = false
+
+      [apps.form_app.endpoints.strict_create.schema.types]
+      name = "string"
+
+[apps.events_app]
+
+  [apps.events_app.endpoints.events_create]
+  path = "/events"
+  method = "POST"
+
+    [apps.events_app.endpoints.events_create.schema]
+    required = ["title", "starts_at"]
+    allow_unknown_fields = true
+
+      [apps.events_app.endpoints.events_create.schema.types]
+      title = "string"
+      starts_at = "datetime"
+      birthday = "date"
 
 [apps.minimal_app]
 
@@ -1626,6 +1738,242 @@ api_key_secret = "gallery_secret_456"
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json = body_json(response).await;
         assert_eq!(json["error"]["code"], "script_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn schema_valid_document_with_unknown_fields_passes() {
+        // allow_unknown_fields = true: alle required-Felder gesetzt, Typen
+        // korrekt, zusaetzliche undeklarierte Felder sind erlaubt.
+        let body = json!({
+            "name": "Ada Lovelace",
+            "grp": "kunden",
+            "summe": 42.5,
+            "is_priority": false,
+            "notiz": "freies Feld",
+            "tags": ["a", "b"]
+        });
+        let response = send(app(), req_json("POST", "/form_app/contacts", &[], &body)).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let doc = body_json(response).await;
+        assert_eq!(doc["name"], "Ada Lovelace");
+        assert_eq!(doc["summe"], 42.5);
+
+        // Optionale getypte Felder duerfen fehlen.
+        let response = send(
+            app(),
+            req_json(
+                "POST",
+                "/form_app/contacts",
+                &[],
+                &json!({"name": "nur pflicht", "grp": "g"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn schema_rejects_missing_required_and_wrong_types_with_400() {
+        // Fehlendes required-Feld UND typfremde Felder: 400 mit allen
+        // Details (gesammelt, nicht nur der erste Fund).
+        let body = json!({
+            "name": 7,
+            "summe": "keine zahl",
+            "is_priority": "ja"
+        });
+        let response = send(app(), req_json("POST", "/form_app/contacts", &[], &body)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(response).await;
+        assert_eq!(err["error"]["code"], "validation_failed");
+        let details = err["error"]["details"].as_array().expect("details");
+        let details: Vec<&str> = details
+            .iter()
+            .map(|d| d.as_str().expect("string detail"))
+            .collect();
+        assert!(details.contains(&"Field 'grp' is required"), "{details:?}");
+        assert!(
+            details.contains(&"Field 'name' must be a string"),
+            "{details:?}"
+        );
+        assert!(
+            details.contains(&"Field 'summe' must be a number"),
+            "{details:?}"
+        );
+        assert!(
+            details.contains(&"Field 'is_priority' must be a boolean"),
+            "{details:?}"
+        );
+
+        // Abgewiesene Dokumente erreichen die Kollektion nicht.
+        let response = send(app(), req("GET", "/form_app/contacts")).await;
+        let list = body_json(response).await;
+        assert_eq!(list["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn schema_patch_partial_passes_without_required_fields() {
+        let router = app();
+        let body = json!({"name": "original", "grp": "g1", "notiz": "bleibt"});
+        let response = send(
+            router.clone(),
+            req_json("POST", "/form_app/contacts", &[], &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let id = body_json(response).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Partieller Patch ohne die required-Felder name/grp: valide —
+        // nur der uebergebene Ausschnitt wird typgeprueft.
+        let patch = json!({"summe": 5});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", &format!("/form_app/contacts/{id}"), &[], &patch),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let doc = body_json(response).await;
+        assert_eq!(doc["summe"], 5);
+        assert_eq!(doc["name"], "original", "PATCH must merge, not replace");
+
+        // Typ-Regel greift im Patch weiterhin: typfremder Wert -> 400 und
+        // der Bestand bleibt unangetastet.
+        let response = send(
+            router.clone(),
+            req_json(
+                "PATCH",
+                &format!("/form_app/contacts/{id}"),
+                &[],
+                &json!({"summe": "text"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(response).await;
+        assert_eq!(err["error"]["code"], "validation_failed");
+
+        let response = send(
+            router.clone(),
+            req("GET", &format!("/form_app/contacts/{id}")),
+        )
+        .await;
+        let doc = body_json(response).await;
+        assert_eq!(
+            doc["summe"], 5,
+            "abgewiesener Patch darf den Bestand nicht anfassen"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_endpoint_rejects_unknown_fields() {
+        let body = json!({"name": "ok", "surprise": true});
+        let response = send(app(), req_json("POST", "/form_app/strict", &[], &body)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(response).await;
+        assert_eq!(err["error"]["code"], "validation_failed");
+        let details = err["error"]["details"].as_array().unwrap();
+        assert!(
+            details[0]
+                .as_str()
+                .unwrap()
+                .contains("Field 'surprise' is not allowed"),
+            "{details:?}"
+        );
+
+        // Ohne zusaetzliche Felder geht derselbe Payload durch.
+        let response = send(
+            app(),
+            req_json("POST", "/form_app/strict", &[], &json!({"name": "ok"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn schema_date_and_datetime_formats_are_enforced() {
+        // RFC 3339 mit Offset plus ISO-Datum: 201.
+        let body = json!({
+            "title": "Release",
+            "starts_at": "2026-11-05T09:00:00+01:00",
+            "birthday": "1990-07-14"
+        });
+        let response = send(app(), req_json("POST", "/events_app/events", &[], &body)).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Deutsche Schreibweise bzw. Nicht-Schaltjahr: 400 mit beiden
+        // Verstoessen, deterministisch sortiert in den Details.
+        let body = json!({
+            "title": "Release",
+            "starts_at": "23.10.2026 14:30",
+            "birthday": "2023-02-29"
+        });
+        let response = send(app(), req_json("POST", "/events_app/events", &[], &body)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(response).await;
+        assert_eq!(err["error"]["code"], "validation_failed");
+        let details = err["error"]["details"].as_array().unwrap();
+        assert_eq!(
+            details
+                .iter()
+                .map(|d| d.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "Field 'birthday' must be a date",
+                "Field 'starts_at' must be a datetime",
+            ],
+            "{details:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_put_enforces_required_like_post() {
+        let router = app();
+        let body = json!({"name": "alt", "grp": "g1"});
+        let response = send(
+            router.clone(),
+            req_json("POST", "/form_app/contacts", &[], &body),
+        )
+        .await;
+        let id = body_json(response).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // PUT ohne required-Feld -> 400 (Replace-Semantik, kein Partial).
+        let response = send(
+            router.clone(),
+            req_json(
+                "PUT",
+                &format!("/form_app/contacts/{id}"),
+                &[],
+                &json!({"name": "unvollstaendig"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(response).await;
+        let details = err["error"]["details"].as_array().unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.as_str().unwrap() == "Field 'grp' is required"),
+            "{details:?}"
+        );
+
+        // Vollstaendiges PUT geht durch.
+        let response = send(
+            router,
+            req_json(
+                "PUT",
+                &format!("/form_app/contacts/{id}"),
+                &[],
+                &json!({"name": "neu", "grp": "g2"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

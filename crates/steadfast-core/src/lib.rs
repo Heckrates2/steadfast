@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod error;
+pub mod schema;
 pub mod script;
 
 pub use config::{
@@ -15,4 +16,5 @@ pub use config::{
     MAX_CORS_MAX_AGE_SECS, MAX_PAGE_SIZE, MIN_API_KEY_SECRET_LEN,
 };
 pub use error::EngineError;
+pub use schema::{EndpointSchema, FieldType};
 pub use script::{CompiledScript, ScriptRuntime};

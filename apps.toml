@@ -61,6 +61,26 @@ api_key_secret = "super_geheimes_todo_salt_123"
   }
   """
 
+  # --- Schema-Validierung (optional, nur POST/PUT/PATCH) --------------------
+  # Wird beim Start vorkompiliert und VOR dem Skript geprueft: fehlende
+  # Pflichtfelder oder Typverstoesse kommen als 400 mit
+  # `error.code = "validation_failed"` zurueck, bevor Daten entstehen.
+  #   required             — Pflichtfelder (bei PATCH ohne Pflicht-Check)
+  #   allow_unknown_fields — false (Default) = strikt, undeklarierte Felder abweisen
+  #   types                — Typ pro Feld: "string" | "number" | "boolean" |
+  #                          "object" | "array" | "null" |
+  #                          "date" (YYYY-MM-DD, inkl. Schaltjahre) |
+  #                          "datetime" (RFC 3339, Offset/Z ist Pflicht)
+  # Hinweis: der Schema-Block steht bewusst NACH business_logic — alles nach
+  # einer [section] gehoert dieser Sektion.
+  [apps.todo_app.endpoints.tasks_create.schema]
+  required = ["title"]
+  allow_unknown_fields = true
+
+    [apps.todo_app.endpoints.tasks_create.schema.types]
+    title = "string"
+    is_priority = "boolean"
+
   # --- Demo-Erweiterung: vollstaendiges CRUD ueber dieselbe Kollektion ---
 
   [apps.todo_app.endpoints.tasks_replace]

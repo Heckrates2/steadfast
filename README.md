@@ -122,6 +122,12 @@ rate limiting and TLS belong).
 
 * **Config-driven endpoints** — routes, auth flags, paging, filter allowlists and sandboxed
   [Rhai](https://rhai.rs) hooks are declared, precompiled and validated at startup (fail-fast).
+* **Declarative schema validation** — an optional per-endpoint `[schema]` section on
+  mutations (`required`, field `types` — including `"date"` and RFC 3339 `"datetime"` —,
+  strict unknown-field policy) is precompiled at startup into plain hash lookups and
+  enforced in the hot path before any script runs or a write lock is taken; violations
+  return a structured `400 validation_failed` with every finding. PATCH checks types on
+  the submitted fields but never demands `required` ones.
 * **Schemaless JSON documents**, shared as `Arc<Value>` — read paths work without copies.
 * **Persistence ready**: every mutation goes to a CRC32-secured WAL (backpressure instead
   of loss), snapshots rotate atomically, replay is crash-tolerant.
@@ -131,7 +137,7 @@ rate limiting and TLS belong).
   API-key compare, create-if-absent POST (409), atomic PATCH, duplicate-header rejection,
   optional gateway provenance (`X-Internal-Auth`), 1 MiB body limit, auth before 404,
   generic error messages. Per-app CORS (preflight, origin allowlist, credential rules) and
-  gzip compression for large JSON responses. 138 tests.
+  gzip compression for large JSON responses. 164 tests.
 
 ## `apps.toml` reference
 
@@ -150,6 +156,7 @@ rate limiting and TLS belong).
 | `endpoints.<name>.paging_default` | Endpoint | Default page size for list GETs (1..=100, default 20) |
 | `endpoints.<name>.filter_fields` | Endpoint | Optional allowlist of filterable/sortable fields — security allowlist **and** index switch |
 | `endpoints.<name>.business_logic` | Endpoint | Rhai script with hook `fn on_request(payload, user)`; runs before storage on POST/PUT/PATCH; `throw` → 422 |
+| `endpoints.<name>.schema` | Endpoint | Optional validation for POST/PUT/PATCH. `required = [...]` (enforced on POST/PUT; PATCH is partial), `allow_unknown_fields` (default `false` — reject undeclared fields), `schema.types.<field> = "string" \| "number" \| "boolean" \| "object" \| "array" \| "null" \| "date" (strict `YYYY-MM-DD`, leap years included) \| "datetime" (RFC 3339 — timezone `Z`/`±HH:MM` required). Invalid type strings or field names abort startup |
 
 CORS is enforced per app in middleware: preflights (`OPTIONS` + `Access-Control-Request-Method`)
 are answered with 204 (no auth, no storage touched) after checking origin, method and headers;
@@ -175,8 +182,9 @@ can read it.
 
 * `GET /<app>/<coll>` — list with paging, equality/range filters, sorting.
 * `GET /<app>/<coll>/{id}` — item or 404.
-* `POST /<app>/<coll>` — script → engine sets missing `id` (UUID v4) → `201` + `Location`.
-  Existing id → `409 already_exists` (strict create-if-absent, stock untouched).
+* `POST /<app>/<coll>` — schema check → script → engine sets missing `id` (UUID v4) →
+  `201` + `Location`. Existing id → `409 already_exists` (strict create-if-absent, stock
+  untouched).
 * `PUT /<app>/<coll>/{id}` — full replace, `id` forced from path.
 * `PATCH /<app>/<coll>/{id}` — shallow merge + script, atomic under the collection's write
   lock (no lost updates; a script `throw` commits nothing).
@@ -191,8 +199,9 @@ Field names must match `[A-Za-z0-9_]{1,64}` — everything else is a 400 at the 
 
 Status codes: 404 unknown app/item · 401 missing/invalid key (also for unknown paths of
 apps with a secret — no enumeration oracle) · 400 bad JSON/query or duplicate identity
-headers · 405 (+ `Allow`) unconfigured method · 413 body > 1 MiB · 422 script rejection ·
-500 sandbox limits (generic message, details in the log).
+headers · 400 `validation_failed` with sorted `error.details` when a payload misses its
+declared schema · 405 (+ `Allow`) unconfigured method · 413 body > 1 MiB · 422 script
+rejection · 500 sandbox limits (generic message, details in the log).
 
 User metadata for scripts comes from `X-User-Id` / `X-User-Role` (defaults `anonymous` /
 `user`). Set `ENGINE_GATEWAY_SECRET` and these headers only count when the request proves
