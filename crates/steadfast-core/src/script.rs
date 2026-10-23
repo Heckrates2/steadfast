@@ -56,11 +56,7 @@ impl ScriptRuntime {
         let hook = ast
             .iter_functions()
             .find(|f| f.name == HOOK_NAME)
-            .ok_or_else(|| {
-                compile_error(format!(
-                    "must define `fn {HOOK_NAME}(payload, user)`"
-                ))
-            })?;
+            .ok_or_else(|| compile_error(format!("must define `fn {HOOK_NAME}(payload, user)`")))?;
         if hook.params.len() != 2 {
             return Err(compile_error(format!(
                 "`{HOOK_NAME}` must take exactly 2 parameters (payload, user), found {}",
@@ -109,8 +105,9 @@ impl ScriptRuntime {
                         result.type_name()
                     )));
                 }
-                rhai::serde::from_dynamic(&result)
-                    .map_err(|e| EngineError::ScriptOutput(format!("script result is not valid JSON: {e}")))
+                rhai::serde::from_dynamic(&result).map_err(|e| {
+                    EngineError::ScriptOutput(format!("script result is not valid JSON: {e}"))
+                })
             }
             Err(err) => Err(map_eval_error(*err)),
         }
@@ -188,12 +185,8 @@ mod tests {
         )
         .expect("script must compile");
 
-        let result = ScriptRuntime::exec(
-            &script,
-            json!({"items": ["a", "b"]}),
-            user(),
-        )
-        .expect("exec must succeed");
+        let result = ScriptRuntime::exec(&script, json!({"items": ["a", "b"]}), user())
+            .expect("exec must succeed");
 
         assert_eq!(result["mark"], json!("premium"));
         assert_eq!(result["count"], json!(2));
@@ -211,8 +204,7 @@ mod tests {
         )
         .expect("script must compile");
 
-        let err = ScriptRuntime::exec(&script, json!({}), user())
-            .expect_err("throw must fail");
+        let err = ScriptRuntime::exec(&script, json!({}), user()).expect_err("throw must fail");
         match err {
             EngineError::ScriptRejected(message) => {
                 assert!(message.contains("Nur Premium-Nutzer erlaubt!"), "{message}");
@@ -261,12 +253,8 @@ mod tests {
         assert!(matches!(rejected, EngineError::ScriptRejected(_)));
 
         // Leerer Titel: abgelehnt.
-        let rejected = ScriptRuntime::exec(
-            &script,
-            json!({"title": ""}),
-            user(),
-        )
-        .expect_err("empty title must be rejected");
+        let rejected = ScriptRuntime::exec(&script, json!({"title": ""}), user())
+            .expect_err("empty title must be rejected");
         assert!(matches!(rejected, EngineError::ScriptRejected(_)));
     }
 
@@ -279,11 +267,9 @@ mod tests {
 
     #[test]
     fn wrong_arity_fails_compile() {
-        let err = ScriptRuntime::compile(
-            "test/arity",
-            "fn on_request(payload) { return payload; }",
-        )
-        .expect_err("wrong arity must fail");
+        let err =
+            ScriptRuntime::compile("test/arity", "fn on_request(payload) { return payload; }")
+                .expect_err("wrong arity must fail");
         assert!(err.message().contains("2 parameters"), "{err}");
     }
 
@@ -312,14 +298,12 @@ mod tests {
 
     #[test]
     fn non_object_return_is_invalid_output() {
-        let script = ScriptRuntime::compile(
-            "test/scalar",
-            "fn on_request(payload, user) { return 42; }",
-        )
-        .expect("script must compile");
+        let script =
+            ScriptRuntime::compile("test/scalar", "fn on_request(payload, user) { return 42; }")
+                .expect("script must compile");
 
-        let err = ScriptRuntime::exec(&script, json!({}), user())
-            .expect_err("scalar return must fail");
+        let err =
+            ScriptRuntime::exec(&script, json!({}), user()).expect_err("scalar return must fail");
         assert!(matches!(err, EngineError::ScriptOutput(_)), "{err:?}");
     }
 }

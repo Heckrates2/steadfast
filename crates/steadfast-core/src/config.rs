@@ -19,6 +19,34 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// grob genug, um Brute-Force auf kurze Keys unattraktiv zu machen.
 pub const MIN_API_KEY_SECRET_LEN: usize = 16;
 
+/// Ober grenze fuer `cors.max_age_secs` (24 h). Browser deckeln den Preflight-
+/// Cache ohnehin selbst; groessere Werte sind ein Config-Fehler.
+pub const MAX_CORS_MAX_AGE_SECS: u64 = 86_400;
+
+/// Alle vom Server unterstuetzten Methoden in kanonischer Reihenfolge —
+/// der Default fuer `cors.allowed_methods` und die Sortierordnung des
+/// `Access-Control-Allow-Methods`-Headers.
+const ALL_HTTP_METHODS: [HttpMethod; 5] = [
+    HttpMethod::Get,
+    HttpMethod::Post,
+    HttpMethod::Put,
+    HttpMethod::Patch,
+    HttpMethod::Delete,
+];
+
+/// Default-Allowlist fuer `Access-Control-Allow-Headers`: genau die Header,
+/// die die Engine selbst aus Requests liest. (Bewusst OHNE `X-Internal-Auth`
+/// — das ist ein Gateway-interner Header und gehoert nicht in Browser-
+/// Preflights.)
+const DEFAULT_CORS_HEADERS: [&str; 4] = ["content-type", "x-api-key", "x-user-id", "x-user-role"];
+
+/// Default fuer `cors.exposed_headers`: `Location` auf 201 Created ist der
+/// einzige eigene Header, den die Engine sendet — und er ist NICHT
+/// CORS-safelisted, ohne Freigabe kann Browser-JS ihn nicht lesen. Alle
+/// safelisted Header (Content-Type, Content-Length, ...) liest der Browser
+/// ohnehin; alles Weitere traegt der Betreiber explizit nach.
+const DEFAULT_CORS_EXPOSED_HEADERS: [&str; 1] = ["location"];
+
 /// HTTP-Methoden, die die Engine generieren kann. Eigener Enum (statt
 /// `axum::http::Method`), damit steadfast-core HTTP-frei bleibt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,7 +92,20 @@ struct AppsFile {
 struct AppConfigRaw {
     api_key_secret: Option<String>,
     #[serde(default)]
+    cors: Option<CorsConfigRaw>,
+    #[serde(default)]
     endpoints: HashMap<String, EndpointRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CorsConfigRaw {
+    allowed_origins: Vec<String>,
+    allowed_methods: Option<Vec<String>>,
+    allowed_headers: Option<Vec<String>>,
+    exposed_headers: Option<Vec<String>>,
+    #[serde(default)]
+    allow_credentials: bool,
+    max_age_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,10 +138,92 @@ pub struct EndpointRuntime {
     pub script: Option<Arc<CompiledScript>>,
 }
 
+/// CORS-Ursprungsregel einer App (fertig validiert).
+#[derive(Debug, Clone)]
+pub enum AllowedOrigins {
+    /// `allowed_origins = ["*"]`: jede Origin erlaubt (Antwort `*`).
+    /// Nur ohne `allow_credentials` zulaessig — Browser lehnen
+    /// `Access-Control-Allow-Origin: *` neben Credentials ab.
+    Any,
+    /// Exakte Origins, beim Laden lowercase normalisiert. Der
+    /// Laufzeitvergleich ist case-insensitive (Header-Namen/Hosts sind es
+    /// per Spezifikation), der Echo-Wert bleibt der Original-Header.
+    List(Arc<[String]>),
+}
+
+/// Fertig validierte CORS-Einstellungen einer App. Der Server leitet daraus
+/// Preflight-Antworten und die `Access-Control-*`-Header echter Responses
+/// ab; Apps ohne `[cors]`-Sektion (`None`) bleiben unangetastet.
+#[derive(Debug, Clone)]
+pub struct CorsConfig {
+    pub allowed_origins: AllowedOrigins,
+    /// Erlaubte (Preflight-)Methoden in kanonischer Reihenfolge.
+    pub allowed_methods: Arc<[HttpMethod]>,
+    /// Erlaubte Request-Header, lowercase normalisiert, sortiert.
+    pub allowed_headers: Arc<[String]>,
+    /// Response-Header, die Browser-JS via `Access-Control-Expose-Headers`
+    /// lesen darf (safelisted Header ausgenommen — die darf es immer).
+    /// Lowercase normalisiert, sortiert, nie leer.
+    pub exposed_headers: Arc<[String]>,
+    pub allow_credentials: bool,
+    /// Preflight-Cachezeit in Sekunden (0..=MAX_CORS_MAX_AGE_SECS).
+    pub max_age_secs: Option<u64>,
+}
+
+impl CorsConfig {
+    /// Origin-Pruefung (case-insensitive Gesamtabgleich).
+    pub fn origin_allowed(&self, origin: &str) -> bool {
+        match &self.allowed_origins {
+            AllowedOrigins::Any => true,
+            AllowedOrigins::List(list) => {
+                let lowered = origin.to_ascii_lowercase();
+                list.iter().any(|allowed| allowed == &lowered)
+            }
+        }
+    }
+
+    /// Ist eine per `Access-Control-Request-Method` angefragte Methode
+    /// erlaubt? (Methodennamen sind case-insensitive.)
+    pub fn method_allowed(&self, method: &str) -> bool {
+        self.allowed_methods
+            .iter()
+            .any(|m| m.as_str().eq_ignore_ascii_case(method))
+    }
+
+    /// Ist ein per `Access-Control-Request-Headers` angefragter Header
+    /// erlaubt? (Header-Namen sind case-insensitive.)
+    pub fn header_allowed(&self, name: &str) -> bool {
+        self.allowed_headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
+    }
+
+    /// `Access-Control-Allow-Methods`-Wert in kanonischer Reihenfolge.
+    pub fn allow_methods_header(&self) -> String {
+        self.allowed_methods
+            .iter()
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// `Access-Control-Allow-Headers`-Wert (lowercase, sortiert).
+    pub fn allow_headers_header(&self) -> String {
+        self.allowed_headers.join(", ")
+    }
+
+    /// `Access-Control-Expose-Headers`-Wert (lowercase, sortiert). Gehoert
+    /// nur auf echte Antworten, nicht auf Preflights (Fetch-Spec).
+    pub fn expose_headers_header(&self) -> String {
+        self.exposed_headers.join(", ")
+    }
+}
+
 /// Eine Anwendung: Secret plus alle Endpunkte (Schluessel = Endpunktname).
 #[derive(Debug, Clone)]
 pub struct AppConfigRuntime {
     pub api_key_secret: Option<Arc<str>>,
+    pub cors: Option<Arc<CorsConfig>>,
     pub endpoints: HashMap<String, Arc<EndpointRuntime>>,
 }
 
@@ -114,9 +237,8 @@ impl EngineConfig {
     /// Laedt und validiert eine `apps.toml` von der Platte.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, EngineError> {
         let path = path.as_ref();
-        let raw = std::fs::read_to_string(path).map_err(|e| {
-            EngineError::Config(format!("cannot read {}: {e}", path.display()))
-        })?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| EngineError::Config(format!("cannot read {}: {e}", path.display())))?;
         Self::from_toml(&raw)
     }
 
@@ -174,6 +296,11 @@ fn validate_and_compile(
             )));
         }
 
+        let cors = match raw_app.cors {
+            None => None,
+            Some(raw_cors) => Some(Arc::new(validate_cors(&app_id, raw_cors)?)),
+        };
+
         let mut endpoints = HashMap::new();
         // (Pfad, Methode) -> Endpunktname, um Doppelbelegungen zu finden.
         let mut seen_routes: HashMap<(String, HttpMethod), String> = HashMap::new();
@@ -192,7 +319,8 @@ fn validate_and_compile(
                 ))
             })?;
 
-            if let Some(previous) = seen_routes.insert((path.clone(), method), endpoint_name.clone())
+            if let Some(previous) =
+                seen_routes.insert((path.clone(), method), endpoint_name.clone())
             {
                 return Err(EngineError::Config(format!(
                     "app `{app_id}`: endpoints `{previous}` and `{endpoint_name}` \
@@ -269,6 +397,7 @@ fn validate_and_compile(
             app_id,
             AppConfigRuntime {
                 api_key_secret: secret.map(Into::into),
+                cors,
                 endpoints,
             },
         );
@@ -287,7 +416,10 @@ fn resolve_api_key_secret(
     raw: &str,
     env_lookup: &impl Fn(&str) -> Option<String>,
 ) -> Result<String, EngineError> {
-    let Some(inner) = raw.strip_prefix("${").and_then(|rest| rest.strip_suffix('}')) else {
+    let Some(inner) = raw
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
         return Ok(raw.to_string());
     };
     let name = inner.trim();
@@ -306,6 +438,218 @@ fn resolve_api_key_secret(
              export it before starting the engine"
         ))),
     }
+}
+
+// --- CORS-Validierung ---------------------------------------------------------
+
+/// Validiert die `[cors]`-Sektion einer App (Fail-Fast beim Start).
+fn validate_cors(app_id: &str, raw: CorsConfigRaw) -> Result<CorsConfig, EngineError> {
+    if raw.allowed_origins.is_empty() {
+        return Err(EngineError::Config(format!(
+            "app `{app_id}`: cors.allowed_origins must not be empty \
+             (list explicit origins or exactly [\"*\"])"
+        )));
+    }
+    let has_star = raw.allowed_origins.iter().any(|o| o == "*");
+    if has_star && raw.allowed_origins.len() > 1 {
+        return Err(EngineError::Config(format!(
+            "app `{app_id}`: cors.allowed_origins `*` cannot be combined with explicit origins"
+        )));
+    }
+
+    let allowed_origins = if has_star {
+        // `Access-Control-Allow-Origin: *` neben Credentials ist per Spec
+        // ungueltig — Browser lehnen solche Antworten ab. Also Fail-Fast.
+        if raw.allow_credentials {
+            return Err(EngineError::Config(format!(
+                "app `{app_id}`: cors.allowed_origins [\"*\"] cannot be combined with \
+                 allow_credentials = true — list explicit origins instead"
+            )));
+        }
+        AllowedOrigins::Any
+    } else {
+        let mut origins = Vec::with_capacity(raw.allowed_origins.len());
+        for origin in &raw.allowed_origins {
+            validate_origin(origin).map_err(|reason| {
+                EngineError::Config(format!(
+                    "app `{app_id}`: cors.allowed_origins entry `{origin}`: {reason}"
+                ))
+            })?;
+            origins.push(origin.to_ascii_lowercase());
+        }
+        origins.sort();
+        origins.dedup();
+        AllowedOrigins::List(origins.into())
+    };
+
+    let allowed_methods = match raw.allowed_methods {
+        None => Arc::from(ALL_HTTP_METHODS),
+        Some(methods) => {
+            if methods.is_empty() {
+                return Err(EngineError::Config(format!(
+                    "app `{app_id}`: cors.allowed_methods must not be empty"
+                )));
+            }
+            let mut parsed = methods
+                .iter()
+                .map(|raw_method| {
+                    HttpMethod::parse(raw_method).ok_or_else(|| {
+                        EngineError::Config(format!(
+                            "app `{app_id}`: cors.allowed_methods entry `{raw_method}` is \
+                             not supported (allowed: GET, POST, PUT, PATCH, DELETE — \
+                             OPTIONS-Preflights beantwortet die Engine selbst)"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            parsed.sort();
+            parsed.dedup();
+            parsed.into()
+        }
+    };
+
+    let allowed_headers = match raw.allowed_headers {
+        None => Arc::from_iter(DEFAULT_CORS_HEADERS.iter().map(|name| name.to_string())),
+        Some(headers) => {
+            if headers.is_empty() {
+                return Err(EngineError::Config(format!(
+                    "app `{app_id}`: cors.allowed_headers must not be empty"
+                )));
+            }
+            let mut normalized = Vec::with_capacity(headers.len());
+            for name in &headers {
+                validate_header_name(name).map_err(|reason| {
+                    EngineError::Config(format!(
+                        "app `{app_id}`: cors.allowed_headers entry `{name}`: {reason}"
+                    ))
+                })?;
+                normalized.push(name.to_ascii_lowercase());
+            }
+            normalized.sort();
+            normalized.dedup();
+            normalized.into()
+        }
+    };
+
+    let exposed_headers = match raw.exposed_headers {
+        None => Arc::from_iter(
+            DEFAULT_CORS_EXPOSED_HEADERS
+                .iter()
+                .map(|name| name.to_string()),
+        ),
+        Some(headers) => {
+            if headers.is_empty() {
+                return Err(EngineError::Config(format!(
+                    "app `{app_id}`: cors.exposed_headers must not be empty \
+                     (remove the key to keep the [\"location\"] default)"
+                )));
+            }
+            let mut normalized = Vec::with_capacity(headers.len());
+            for name in &headers {
+                validate_header_name(name).map_err(|reason| {
+                    EngineError::Config(format!(
+                        "app `{app_id}`: cors.exposed_headers entry `{name}`: {reason}"
+                    ))
+                })?;
+                normalized.push(name.to_ascii_lowercase());
+            }
+            normalized.sort();
+            normalized.dedup();
+            normalized.into()
+        }
+    };
+
+    if let Some(age) = raw.max_age_secs {
+        if age == 0 || age > MAX_CORS_MAX_AGE_SECS {
+            return Err(EngineError::Config(format!(
+                "app `{app_id}`: cors.max_age_secs must be between 1 and {MAX_CORS_MAX_AGE_SECS}"
+            )));
+        }
+    }
+
+    Ok(CorsConfig {
+        allowed_origins,
+        allowed_methods,
+        allowed_headers,
+        exposed_headers,
+        allow_credentials: raw.allow_credentials,
+        max_age_secs: raw.max_age_secs,
+    })
+}
+
+/// Eine Origin ist genau `scheme://host[:port]` — kein Pfad, keine Query,
+/// kein Fragment, keine Userinfo (`@`). IPv6-Hosts in Brackets sind erlaubt.
+/// `*` wird vom Aufrufer gesondert behandelt und ist hier ein Fehler.
+fn validate_origin(origin: &str) -> Result<(), String> {
+    if origin == "*" {
+        return Err("the wildcard must be the only entry: allowed_origins = [\"*\"]".into());
+    }
+    if origin.is_empty() || origin.len() > 256 {
+        return Err("length must be 1..=256 characters".into());
+    }
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return Err(
+            "must have the form `scheme://host[:port]` (e.g. `https://app.example.com`)".into(),
+        );
+    };
+    let scheme_ok = !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    if !scheme_ok {
+        return Err(format!("invalid scheme `{scheme}:`"));
+    }
+    if authority.is_empty() {
+        return Err("host must not be empty".into());
+    }
+    // Zeichen-Pruefung nur auf dem Host-Teil (das Scheme enthaelt `://`).
+    if authority.contains(['/', '?', '#', '@', ' ']) {
+        return Err(
+            "must not contain path/query/fragment/userinfo or whitespace (host[:port] only)".into(),
+        );
+    }
+    let host_ok = authority
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']'));
+    if !host_ok {
+        return Err("host must match [A-Za-z0-9._-] (optional `:port`, `[...]` for IPv6)".into());
+    }
+    Ok(())
+}
+
+/// HTTP-Headername (Token): `[A-Za-z0-9!#$%&'*+.^_`|~-]`, max. 128 Zeichen.
+fn validate_header_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || is_header_token_special(b));
+    if ok {
+        Ok(())
+    } else {
+        Err("must be a valid HTTP header name (token, 1..=128 chars)".into())
+    }
+}
+
+fn is_header_token_special(b: u8) -> bool {
+    matches!(
+        b,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+    )
 }
 
 /// App-IDs werden Teil der URL: streng auf `[a-z0-9_-]`, max. 64 Zeichen.
@@ -411,7 +755,10 @@ api_key_secret = "super_geheimes_todo_salt_123"
 
         let create = app.endpoints.get("tasks_create").unwrap();
         assert!(create.auth_required);
-        assert!(create.script.is_some(), "business_logic must be precompiled");
+        assert!(
+            create.script.is_some(),
+            "business_logic must be precompiled"
+        );
     }
 
     #[test]
@@ -554,7 +901,8 @@ api_key_secret = "short"
 "#;
         let err = EngineConfig::from_toml(src).unwrap_err();
         assert!(
-            err.message().contains(&format!("at least {MIN_API_KEY_SECRET_LEN} characters")),
+            err.message()
+                .contains(&format!("at least {MIN_API_KEY_SECRET_LEN} characters")),
             "{err}"
         );
     }
@@ -584,7 +932,8 @@ api_key_secret = "${TEST_APP_SECRET}"
         let lookup = |name: &str| (name == "TEST_APP_SECRET").then(|| "kurz".to_string());
         let err = EngineConfig::validate_with(file, lookup).unwrap_err();
         assert!(
-            err.message().contains(&format!("at least {MIN_API_KEY_SECRET_LEN} characters")),
+            err.message()
+                .contains(&format!("at least {MIN_API_KEY_SECRET_LEN} characters")),
             "{err}"
         );
     }
@@ -675,5 +1024,268 @@ api_key_secret = "pa$$w0rd-${not_a_var}"
             EngineConfig::from_toml(src),
             Err(EngineError::Config(_))
         ));
+    }
+
+    // --- CORS ------------------------------------------------------------------
+
+    #[test]
+    fn cors_section_parses_with_defaults() {
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["https://app.example.com"]
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let config = EngineConfig::from_toml(src).expect("cors config must load");
+        let cors = config.apps["a"]
+            .cors
+            .as_ref()
+            .expect("cors section must be present");
+
+        // Defaults: alle fuenf Methoden, Engine-Header, keine Credentials,
+        // keine Preflight-Cachezeit.
+        assert_eq!(
+            cors.allowed_methods.as_ref(),
+            [
+                HttpMethod::Get,
+                HttpMethod::Post,
+                HttpMethod::Put,
+                HttpMethod::Patch,
+                HttpMethod::Delete
+            ]
+        );
+        assert_eq!(
+            cors.allowed_headers.as_ref(),
+            ["content-type", "x-api-key", "x-user-id", "x-user-role"]
+        );
+        assert!(!cors.allow_credentials);
+        assert!(cors.max_age_secs.is_none());
+        assert_eq!(
+            cors.exposed_headers.as_ref(),
+            ["location"],
+            "Default: der 201er-Location-Header ist aus JS lesbar"
+        );
+
+        // Origin-Pruefung ist case-insensitive, aber exakt (kein Suffix-Match).
+        assert!(cors.origin_allowed("https://app.example.com"));
+        assert!(cors.origin_allowed("HTTPS://APP.EXAMPLE.COM"));
+        assert!(!cors.origin_allowed("https://evil-app.example.com"));
+        assert!(!cors.origin_allowed("https://app.example.com.evil.dev"));
+        assert!(cors.method_allowed("get"));
+        assert!(!cors.method_allowed("OPTIONS"));
+        assert!(cors.header_allowed("Content-Type"));
+        assert!(!cors.header_allowed("x-internal-auth"));
+
+        assert_eq!(cors.allow_methods_header(), "GET, POST, PUT, PATCH, DELETE");
+    }
+
+    #[test]
+    fn cors_explicit_options_and_origin_normalization() {
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["HTTPS://App.Example.COM", "http://localhost:3000"]
+  allowed_methods = ["post", "GET"]
+  allowed_headers = ["Content-Type", "X-Api-Key"]
+  allow_credentials = true
+  max_age_secs = 600
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let config = EngineConfig::from_toml(src).expect("cors config must load");
+        let cors = config.apps["a"].cors.as_ref().unwrap();
+
+        assert_eq!(
+            cors.allowed_headers.as_ref(),
+            ["content-type", "x-api-key"],
+            "Header-Namen werden lowercase normalisiert und sortiert"
+        );
+        assert_eq!(
+            cors.allowed_methods.as_ref(),
+            [HttpMethod::Get, HttpMethod::Post]
+        );
+        assert!(cors.allow_credentials);
+        assert_eq!(cors.max_age_secs, Some(600));
+    }
+
+    #[test]
+    fn cors_exposed_headers_default_normalization_and_rejection() {
+        // Explizite Liste: lowercase, sortiert, dedupliziert.
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["https://app.example.com"]
+  exposed_headers = ["X-Request-Id", "Location", "LOCATION"]
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let config = EngineConfig::from_toml(src).expect("cors config must load");
+        let cors = config.apps["a"].cors.as_ref().unwrap();
+        assert_eq!(cors.exposed_headers.as_ref(), ["location", "x-request-id"]);
+        assert_eq!(cors.expose_headers_header(), "location, x-request-id");
+
+        // Leere Liste ist abgelehnt (Fail-Fast wie bei allowed_headers).
+        let empty = src.replace(
+            "exposed_headers = [\"X-Request-Id\", \"Location\", \"LOCATION\"]",
+            "exposed_headers = []",
+        );
+        let err = EngineConfig::from_toml(&empty).unwrap_err();
+        assert!(err.message().contains("cors.exposed_headers"), "{err}");
+
+        // Ungueltiger Header-Name wird abgelehnt.
+        let bad = src.replace(
+            "exposed_headers = [\"X-Request-Id\", \"Location\", \"LOCATION\"]",
+            "exposed_headers = [\"bad header!\"]",
+        );
+        let err = EngineConfig::from_toml(&bad).unwrap_err();
+        assert!(err.message().contains("cors.exposed_headers"), "{err}");
+    }
+
+    #[test]
+    fn cors_wildcard_without_credentials_is_allowed() {
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["*"]
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let config = EngineConfig::from_toml(src).expect("wildcard cors must load");
+        let cors = config.apps["a"].cors.as_ref().unwrap();
+        assert!(matches!(cors.allowed_origins, AllowedOrigins::Any));
+        assert!(cors.origin_allowed("https://irgendwas.example"));
+    }
+
+    #[test]
+    fn cors_wildcard_with_credentials_is_rejected() {
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["*"]
+  allow_credentials = true
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(err.message().contains("allow_credentials"), "{err}");
+    }
+
+    #[test]
+    fn cors_mixed_wildcard_list_is_rejected() {
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["*", "https://app.example.com"]
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(err.message().contains("cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn cors_empty_origins_is_rejected() {
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = []
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(err.message().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn cors_invalid_origins_are_rejected() {
+        let cases = [
+            ("app.example.com", "fehlendes scheme"),
+            ("https://", "leerer Host"),
+            ("https://app.example.com/", "Pfad-Slash"),
+            ("https://app.example.com/api", "Pfad"),
+            ("https://app.example.com?x=1", "Query"),
+            ("https://app.example.com#f", "Fragment"),
+            ("https://user@app.example.com", "Userinfo"),
+            ("https://app example.com", "Leerzeichen"),
+            ("1https://app.example.com", "Scheme ohne Leading-Letter"),
+            ("", "leere Origin"),
+        ];
+        for (origin, reason) in cases {
+            let src = format!(
+                r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["{origin}"]
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#
+            );
+            let err = EngineConfig::from_toml(&src).unwrap_err();
+            assert!(
+                err.message().contains("cors.allowed_origins"),
+                "case `{origin}` ({reason}): {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_unsupported_methods_are_rejected() {
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["https://app.example.com"]
+  allowed_methods = ["GET", "OPTIONS"]
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(
+            err.message().contains("OPTIONS") && err.message().contains("not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn cors_invalid_header_names_are_rejected() {
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["https://app.example.com"]
+  allowed_headers = ["content-type", "bad header!"]
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(err.message().contains("cors.allowed_headers"), "{err}");
+    }
+
+    #[test]
+    fn cors_max_age_bounds() {
+        let src = r#"
+[apps.a]
+  [apps.a.cors]
+  allowed_origins = ["https://app.example.com"]
+  max_age_secs = 0
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(err.message().contains("max_age_secs"), "{err}");
+
+        let src = src.replace("max_age_secs = 0", "max_age_secs = 100000");
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("max_age_secs"), "{err}");
     }
 }

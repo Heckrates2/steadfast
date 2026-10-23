@@ -110,19 +110,13 @@ mod tests {
     fn status_and_code_mapping() {
         assert_eq!(EngineError::Unauthorized.status(), 401);
         assert_eq!(EngineError::Unauthorized.code(), "unauthorized");
-        assert_eq!(
-            EngineError::ScriptRejected("nope".into()).status(),
-            422
-        );
+        assert_eq!(EngineError::ScriptRejected("nope".into()).status(), 422);
         assert_eq!(
             EngineError::ScriptRejected("nope".into()).code(),
             "script_rejected"
         );
         assert_eq!(EngineError::NotFound.status(), 404);
-        assert_eq!(
-            EngineError::ScriptLimit("ops".into()).status(),
-            500
-        );
+        assert_eq!(EngineError::ScriptLimit("ops".into()).status(), 500);
     }
 
     #[test]
@@ -139,7 +133,10 @@ mod tests {
             "expected value at line 1 column 3: /etc/engine/secrets.toml".into(),
         );
         assert_eq!(err.client_message(), "request body must be valid JSON");
-        assert!(err.message().contains("/etc/engine/secrets.toml"), "Log-Detail bleibt erhalten");
+        assert!(
+            err.message().contains("/etc/engine/secrets.toml"),
+            "Log-Detail bleibt erhalten"
+        );
 
         let err = EngineError::ScriptLimit("Rhai-Engine: 20000 iterations at fn on_request".into());
         assert_eq!(err.client_message(), "script exceeded its execution budget");

@@ -5,6 +5,8 @@
 //! O(1)-Config-Lookup -> Auth -> Rhai-Sandbox -> schemaloses Speichern.
 
 mod auth;
+mod compression;
+mod cors;
 mod handler;
 mod router;
 mod state;
@@ -36,8 +38,8 @@ async fn main() -> ExitCode {
         .init();
 
     // Flag-Argumente (--data-dir, --snapshot-interval, --max-docs,
-    // --wal-max-segment-mb) plus die klassischen Positionsargumente (CONFIG,
-    // BIND), deren Reihenfolge erhalten bleibt.
+    // --wal-max-segment-mb, --no-compression) plus die klassischen
+    // Positionsargumente (CONFIG, BIND), deren Reihenfolge erhalten bleibt.
     let mut positional: Vec<String> = Vec::new();
     let mut data_dir: Option<PathBuf> = None;
     let mut snapshot_secs: u64 = 60;
@@ -48,6 +50,9 @@ async fn main() -> ExitCode {
     // diese Groesse ueberschreitet — auch mitten im Intervall. Haelt Segmente
     // und damit den Replay-Umfang handhabbar. 0 = unbegrenzt (nur Zeit-Tick).
     let mut wal_max_segment_mb: u64 = 256;
+    // gzip fuer grosse JSON-Antworten (Content-Negotiation via
+    // Accept-Encoding). Default an; --no-compression schaltet ab.
+    let mut compression = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -88,7 +93,9 @@ async fn main() -> ExitCode {
                 Some(raw) => match raw.parse::<u64>() {
                     Ok(secs) => snapshot_secs = secs,
                     Err(_) => {
-                        eprintln!("error: --snapshot-interval erwartet eine Sekundenzahl, bekommen: {raw}");
+                        eprintln!(
+                            "error: --snapshot-interval erwartet eine Sekundenzahl, bekommen: {raw}"
+                        );
                         return ExitCode::FAILURE;
                     }
                 },
@@ -102,7 +109,9 @@ async fn main() -> ExitCode {
                 match raw.parse::<u64>() {
                     Ok(secs) => snapshot_secs = secs,
                     Err(_) => {
-                        eprintln!("error: --snapshot-interval erwartet eine Sekundenzahl, bekommen: {raw}");
+                        eprintln!(
+                            "error: --snapshot-interval erwartet eine Sekundenzahl, bekommen: {raw}"
+                        );
                         return ExitCode::FAILURE;
                     }
                 }
@@ -111,7 +120,9 @@ async fn main() -> ExitCode {
                 Some(raw) => match raw.parse::<u64>() {
                     Ok(mib) => wal_max_segment_mb = mib,
                     Err(_) => {
-                        eprintln!("error: --wal-max-segment-mb erwartet eine MiB-Zahl, bekommen: {raw}");
+                        eprintln!(
+                            "error: --wal-max-segment-mb erwartet eine MiB-Zahl, bekommen: {raw}"
+                        );
                         return ExitCode::FAILURE;
                     }
                 },
@@ -125,16 +136,20 @@ async fn main() -> ExitCode {
                 match raw.parse::<u64>() {
                     Ok(mib) => wal_max_segment_mb = mib,
                     Err(_) => {
-                        eprintln!("error: --wal-max-segment-mb erwartet eine MiB-Zahl, bekommen: {raw}");
+                        eprintln!(
+                            "error: --wal-max-segment-mb erwartet eine MiB-Zahl, bekommen: {raw}"
+                        );
                         return ExitCode::FAILURE;
                     }
                 }
             }
+            "--no-compression" => compression = false,
             arg if arg.starts_with("--") => {
                 eprintln!(
                     "error: unbekanntes Argument `{arg}` — erwartet: \
                      [--data-dir <VERZEICHNIS>] [--snapshot-interval <SEKUNDEN>] \
-                     [--max-docs <ANZAHL>] [--wal-max-segment-mb <MIB>] [CONFIG] [BIND]"
+                     [--max-docs <ANZAHL>] [--wal-max-segment-mb <MIB>] \
+                     [--no-compression] [CONFIG] [BIND]"
                 );
                 return ExitCode::FAILURE;
             }
@@ -204,7 +219,10 @@ async fn main() -> ExitCode {
             // Erster Start: Das Verzeichnis gibt es noch nicht — anlegen,
             // statt das Replay auf einen fehlenden Pfad laufen zu lassen.
             if let Err(err) = std::fs::create_dir_all(dir) {
-                eprintln!("error: Datenverzeichnis {} nicht anlegbar: {err}", dir.display());
+                eprintln!(
+                    "error: Datenverzeichnis {} nicht anlegbar: {err}",
+                    dir.display()
+                );
                 return ExitCode::FAILURE;
             }
             let cold = match replay_data_dir_full(&store, dir) {
@@ -266,6 +284,10 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if !compression {
+        state.set_compression_enabled(false);
+        tracing::info!("gzip-Komprimierung per --no-compression deaktiviert");
+    }
 
     let (apps, endpoints) = state.summary();
     tracing::info!(

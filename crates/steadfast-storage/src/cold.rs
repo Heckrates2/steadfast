@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::Value;
 
-use crate::wal::{parse_snapshot_body, parse_wal_body, LoggedOp};
+use crate::wal::{LoggedOp, parse_snapshot_body, parse_wal_body};
 
 /// Schluessel eines Kalt-Records. Tuple statt zusammengesetzter String, damit
 /// IDs mit Pfadseparatoren nicht kollidieren koennen.
@@ -88,7 +88,11 @@ impl ColdTier {
     /// die Laenge einer evtl. bereits vorhandenen Datei.
     pub fn open_active(&self, path: PathBuf, start_offset: u64) {
         let mut active = self.active.lock().expect("cold active poisoned");
-        *active = Some(ActiveSegment { path, index: HashMap::new(), flushed: start_offset });
+        *active = Some(ActiveSegment {
+            path,
+            index: HashMap::new(),
+            flushed: start_offset,
+        });
     }
 
     /// Der Worker hat einen Record geschrieben: Start-Offset + Payload-
@@ -122,12 +126,15 @@ impl ColdTier {
                 .and_then(|n| n.strip_prefix("wal-"))
                 .and_then(|n| n.strip_suffix(".log"))
                 .and_then(|n| n.parse::<u64>().ok());
-            tiers.insert(0, Arc::new(TierFile {
-                epoch,
-                path: old.path,
-                kind: TierKind::Segment,
-                index: old.index,
-            }));
+            tiers.insert(
+                0,
+                Arc::new(TierFile {
+                    epoch,
+                    path: old.path,
+                    kind: TierKind::Segment,
+                    index: old.index,
+                }),
+            );
         }
         *active = Some(ActiveSegment {
             path: new_path,
@@ -154,7 +161,12 @@ impl ColdTier {
     /// Kein Pruning hier: Beim Replay werden Segmente in aufsteigender
     /// Epoch-Reihenfolge gepusht, und jeder Index bleibt die einzige Quelle
     /// fuer Schluessel, die in keinen der neueren Standaende mehr liegen.
-    pub fn push_closed_segment(&self, epoch: u64, path: PathBuf, index: HashMap<ColdKey, (u64, u32)>) {
+    pub fn push_closed_segment(
+        &self,
+        epoch: u64,
+        path: PathBuf,
+        index: HashMap<ColdKey, (u64, u32)>,
+    ) {
         let mut tiers = self.tiers.write().expect("cold tiers poisoned");
         tiers.push(Arc::new(TierFile {
             epoch: Some(epoch),
@@ -183,7 +195,10 @@ impl ColdTier {
             let tiers = self.tiers.read().expect("cold tiers poisoned");
             let active = self.active.lock().expect("cold active poisoned");
             let cand = active.as_ref().and_then(|a| {
-                a.index.get(&key).copied().map(|(start, len)| (a.path.clone(), a.flushed, start, len))
+                a.index
+                    .get(&key)
+                    .copied()
+                    .map(|(start, len)| (a.path.clone(), a.flushed, start, len))
             });
             (cand, tiers.clone())
         };
@@ -230,15 +245,22 @@ fn read_segment_record(
     // Op-Byte + Schluessel pruefen, ohne das Dokument zu parsen, wenn der
     // Record einem anderen Schluessel gehoert.
     match parse_wal_body(&body) {
-        Ok(LoggedOp::Upsert { app, collection, id, doc })
-            if (app.as_str(), collection.as_str(), id.as_str())
-                == (key.0.as_str(), key.1.as_str(), key.2.as_str()) =>
+        Ok(LoggedOp::Upsert {
+            app,
+            collection,
+            id,
+            doc,
+        }) if (app.as_str(), collection.as_str(), id.as_str())
+            == (key.0.as_str(), key.1.as_str(), key.2.as_str()) =>
         {
             Ok(Some(Some(Arc::new(doc))))
         }
-        Ok(LoggedOp::Delete { app, collection, id })
-            if (app.as_str(), collection.as_str(), id.as_str())
-                == (key.0.as_str(), key.1.as_str(), key.2.as_str()) =>
+        Ok(LoggedOp::Delete {
+            app,
+            collection,
+            id,
+        }) if (app.as_str(), collection.as_str(), id.as_str())
+            == (key.0.as_str(), key.1.as_str(), key.2.as_str()) =>
         {
             Ok(Some(None))
         }

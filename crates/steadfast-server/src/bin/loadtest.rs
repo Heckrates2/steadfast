@@ -49,13 +49,28 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = |what: &str| -> Result<String, String> {
-            it.next().ok_or_else(|| format!("{what} erwartet einen Wert"))
+            it.next()
+                .ok_or_else(|| format!("{what} erwartet einen Wert"))
         };
         match flag.as_str() {
             "--url" => url = Some(value("--url")?),
-            "--duration" => duration_secs = value("--duration")?.parse().map_err(|_| "--duration muss eine Zahl sein")?,
-            "--requests" => requests = Some(value("--requests")?.parse().map_err(|_| "--requests muss eine Zahl sein")?),
-            "--connections" => connections = value("--connections")?.parse().map_err(|_| "--connections muss eine Zahl sein")?,
+            "--duration" => {
+                duration_secs = value("--duration")?
+                    .parse()
+                    .map_err(|_| "--duration muss eine Zahl sein")?
+            }
+            "--requests" => {
+                requests = Some(
+                    value("--requests")?
+                        .parse()
+                        .map_err(|_| "--requests muss eine Zahl sein")?,
+                )
+            }
+            "--connections" => {
+                connections = value("--connections")?
+                    .parse()
+                    .map_err(|_| "--connections muss eine Zahl sein")?
+            }
             "--method" => method = Some(value("--method")?),
             "--body" => body = Some(value("--body")?),
             "--header" => {
@@ -78,7 +93,10 @@ fn parse_args() -> Result<Args, String> {
 
     let url = url.ok_or("--url ist erforderlich")?;
     let method = Method::from_bytes(
-        method.unwrap_or_else(|| "GET".to_string()).to_uppercase().as_bytes(),
+        method
+            .unwrap_or_else(|| "GET".to_string())
+            .to_uppercase()
+            .as_bytes(),
     )
     .map_err(|e| e.to_string())?;
 
@@ -111,11 +129,18 @@ async fn main() {
     let client: Client<HttpConnector, Full<Bytes>> =
         Client::builder(TokioExecutor::new()).build(HttpConnector::new());
 
-    let mut builder = Request::builder().method(args.method.clone()).uri(&args.url);
+    let mut builder = Request::builder()
+        .method(args.method.clone())
+        .uri(&args.url);
     for (name, value) in &args.headers {
         builder = builder.header(name, value);
     }
-    if args.body.is_some() && !args.headers.iter().any(|(n, _)| n.as_str() == "content-type") {
+    if args.body.is_some()
+        && !args
+            .headers
+            .iter()
+            .any(|(n, _)| n.as_str() == "content-type")
+    {
         builder = builder.header("content-type", "application/json");
     }
     let template = builder
@@ -140,7 +165,10 @@ async fn main() {
     // im Dauer-Modus bleibt der Zähler bei 0 und die Dauer entscheidet.
     let tickets = Arc::new(AtomicU64::new(0));
     let progress = if args.requests.is_none() {
-        Some(tokio::spawn(progress_loop(Arc::clone(&requests), args.duration)))
+        Some(tokio::spawn(progress_loop(
+            Arc::clone(&requests),
+            args.duration,
+        )))
     } else {
         None
     };
@@ -199,7 +227,10 @@ async fn main() {
 
     println!("\n--- Ergebnis ---");
     println!("Dauer:            {:.2} s", wall.as_secs_f64());
-    println!("Requests:         {total} ({:.0} RPS)", total as f64 / wall.as_secs_f64());
+    println!(
+        "Requests:         {total} ({:.0} RPS)",
+        total as f64 / wall.as_secs_f64()
+    );
     println!("Verbindungsfehler: {failed}");
     for (index, label) in ["2xx", "3xx", "4xx", "5xx"].iter().enumerate() {
         let count = classes[index].load(Ordering::Relaxed);

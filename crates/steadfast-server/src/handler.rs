@@ -2,20 +2,20 @@
 
 use std::collections::HashMap;
 
+use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use steadfast_core::{EndpointRuntime, EngineError, HttpMethod, ScriptRuntime, MAX_PAGE_SIZE};
-use steadfast_storage::{ListParams, ListResult, PatchOutcome, RangeOp, SortSpec};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use steadfast_core::{EndpointRuntime, EngineError, HttpMethod, MAX_PAGE_SIZE, ScriptRuntime};
+use steadfast_storage::{ListParams, ListResult, PatchOutcome, RangeOp, SortSpec};
 use uuid::Uuid;
 
 use crate::auth::{
-    duplicate_identity_header, extract_user, verify_api_key, verify_gateway_secret,
-    API_KEY_HEADER, INTERNAL_AUTH_HEADER,
+    API_KEY_HEADER, INTERNAL_AUTH_HEADER, duplicate_identity_header, extract_user, verify_api_key,
+    verify_gateway_secret,
 };
 use crate::state::{AppState, PathRoutes};
 
@@ -101,14 +101,10 @@ pub async fn handle(
         "DELETE" => HttpMethod::Delete,
         // Andere Methoden sind im MVP nicht konfigurierbar (N1: auch hier
         // kein Struktur-Oracle fuer unauthentifizierte Requests).
-        _ => return hidden_behind_auth(app_routes, &headers, || {
-            method_not_allowed(path_routes)
-        }),
+        _ => return hidden_behind_auth(app_routes, &headers, || method_not_allowed(path_routes)),
     };
     let Some(endpoint) = path_routes.method(core_method) else {
-        return hidden_behind_auth(app_routes, &headers, || {
-            method_not_allowed(path_routes)
-        });
+        return hidden_behind_auth(app_routes, &headers, || method_not_allowed(path_routes));
     };
 
     // --- Auth (sofortiger Abbruch bei Fehlschlag) -------------------------
@@ -135,7 +131,9 @@ pub async fn handle(
     // Gateway-Secret bleibt das bisherige Vertrauensmodell (dokumentiert).
     let identity_trusted = match state.gateway_secret() {
         Some(secret) => {
-            let provided = headers.get(INTERNAL_AUTH_HEADER).and_then(|v| v.to_str().ok());
+            let provided = headers
+                .get(INTERNAL_AUTH_HEADER)
+                .and_then(|v| v.to_str().ok());
             verify_gateway_secret(provided, secret)
         }
         None => true,
@@ -149,12 +147,20 @@ pub async fn handle(
         (HttpMethod::Get, None) => get_list(&state, endpoint, &app_id, collection, &raw_query),
         (HttpMethod::Post, None) => post_create(&state, endpoint, &app_id, collection, body, user),
         (HttpMethod::Post, Some(_)) => not_found(),
-        (HttpMethod::Put, Some(id)) => put_replace(&state, endpoint, &app_id, collection, id, body, user),
+        (HttpMethod::Put, Some(id)) => {
+            put_replace(&state, endpoint, &app_id, collection, id, body, user)
+        }
         (HttpMethod::Put, None) => bad_request("PUT requires an item id: /{app}/{collection}/{id}"),
-        (HttpMethod::Patch, Some(id)) => patch_merge(&state, endpoint, &app_id, collection, id, body, user),
-        (HttpMethod::Patch, None) => bad_request("PATCH requires an item id: /{app}/{collection}/{id}"),
+        (HttpMethod::Patch, Some(id)) => {
+            patch_merge(&state, endpoint, &app_id, collection, id, body, user)
+        }
+        (HttpMethod::Patch, None) => {
+            bad_request("PATCH requires an item id: /{app}/{collection}/{id}")
+        }
         (HttpMethod::Delete, Some(id)) => delete_item(&state, &app_id, collection, id),
-        (HttpMethod::Delete, None) => bad_request("DELETE requires an item id: /{app}/{collection}/{id}"),
+        (HttpMethod::Delete, None) => {
+            bad_request("DELETE requires an item id: /{app}/{collection}/{id}")
+        }
     };
     // N5: HEAD verhaelt sich wie GET (gleiche Header inkl. Content-Length),
     // liefert aber keinen Body.
@@ -312,19 +318,19 @@ fn parse_list_query(
     for (key, value) in raw_query {
         match key.as_str() {
             "page" => {
-                let parsed: usize = value
-                    .parse()
-                    .map_err(|_| EngineError::BadRequest(format!("invalid `page` value `{value}`")))?;
+                let parsed: usize = value.parse().map_err(|_| {
+                    EngineError::BadRequest(format!("invalid `page` value `{value}`"))
+                })?;
                 if parsed < 1 {
                     return Err(EngineError::BadRequest("`page` must be >= 1".into()));
                 }
                 page = Some(parsed);
             }
             "limit" => {
-                let parsed: usize = value
-                    .parse()
-                    .map_err(|_| EngineError::BadRequest(format!("invalid `limit` value `{value}`")))?;
-                if parsed < 1 || parsed > MAX_PAGE_SIZE {
+                let parsed: usize = value.parse().map_err(|_| {
+                    EngineError::BadRequest(format!("invalid `limit` value `{value}`"))
+                })?;
+                if !(1..=MAX_PAGE_SIZE).contains(&parsed) {
                     return Err(EngineError::BadRequest(format!(
                         "`limit` must be between 1 and {MAX_PAGE_SIZE}"
                     )));
@@ -378,7 +384,9 @@ fn parse_list_query(
     }
     for (key, value) in &filters {
         if !is_valid_query_field(key) {
-            return Err(EngineError::BadRequest(format!("invalid filter field `{key}`")));
+            return Err(EngineError::BadRequest(format!(
+                "invalid filter field `{key}`"
+            )));
         }
         if value.len() > MAX_FILTER_VALUE_LEN {
             return Err(EngineError::BadRequest(
@@ -439,11 +447,11 @@ fn post_create(
 ) -> Response {
     let doc = match parse_json_object(&body) {
         Ok(doc) => doc,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let mut doc = match run_script(endpoint, doc, user) {
         Ok(doc) => doc,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     // ID: vom Skript gesetzt (falls sinnvoll) oder Engine-seitige UUID v4.
@@ -478,10 +486,9 @@ fn post_create(
     };
     let mut response = json_response(StatusCode::CREATED, &stored);
     if let Ok(location) = format!("/{app_id}/{collection}/{id}").parse() {
-        response.headers_mut().insert(
-            axum::http::header::LOCATION,
-            location,
-        );
+        response
+            .headers_mut()
+            .insert(axum::http::header::LOCATION, location);
     }
     response
 }
@@ -499,11 +506,11 @@ fn put_replace(
 ) -> Response {
     let doc = match parse_json_object(&body) {
         Ok(doc) => doc,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let doc = match run_script(endpoint, doc, user) {
         Ok(doc) => doc,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match state.store().replace(app_id, collection, id, doc) {
         Some(stored) => json_response(StatusCode::OK, &stored),
@@ -522,7 +529,7 @@ fn patch_merge(
 ) -> Response {
     let patch = match parse_json_object(&body) {
         Ok(doc) => doc,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     // N4: Merge + Skript laufen IM Store unter dem per-Kollektion-Schreib-
     // Mutex — zwei gleichzeitige PATCHes auf dasselbe Dokument koennen sich
@@ -530,14 +537,16 @@ fn patch_merge(
     // und replace). Der Store loest evicierte Dokumente VOR dem Sperren auf.
     // Ein Skript-`throw` (422) bricht ab, ohne etwas zu committen; der neue
     // seq-Eintrag ordnet das Dokument wie bei PUT hinten ein.
-    let outcome = state.store().patch_merge(app_id, collection, id, |current| {
-        let merged = merge_shallow(current, patch);
-        run_script(endpoint, merged, user)
-    });
+    let outcome = state
+        .store()
+        .patch_merge(app_id, collection, id, |current| {
+            let merged = merge_shallow(current, patch);
+            run_script(endpoint, merged, user)
+        });
     match outcome {
         PatchOutcome::Updated(stored) => json_response(StatusCode::OK, &stored),
         PatchOutcome::NotFound => not_found(),
-        PatchOutcome::Rejected(response) => response,
+        PatchOutcome::Rejected(response) => *response,
     }
 }
 
@@ -563,26 +572,34 @@ fn delete_item(state: &AppState, app_id: &str, collection: &str, id: &str) -> Re
 
 /// Fuehrt den vorkompilierten Hook aus (falls konfiguriert) und mappt
 /// Sandbox-Fehler auf HTTP-Antworten. Payload/User bleiben strukturierte
-/// Werte — Nutzereingaben werden nie als Code interpretiert.
-fn run_script(endpoint: &EndpointRuntime, payload: Value, user: Value) -> Result<Value, Response> {
+/// Werte — Nutzereingaben werden nie als Code interpretiert. Der Err-Typ
+/// ist geboxt, weil `Response` groesser als die Clippy-Schwelle ist und
+/// Fehlerpfade billig bleiben sollen.
+fn run_script(
+    endpoint: &EndpointRuntime,
+    payload: Value,
+    user: Value,
+) -> Result<Value, Box<Response>> {
     let Some(script) = &endpoint.script else {
         return Ok(payload);
     };
     match ScriptRuntime::exec(script, payload, user) {
         Ok(result) => Ok(result),
-        Err(err) => Err(engine_error_response(&err)),
+        Err(err) => Err(Box::new(engine_error_response(&err))),
     }
 }
 
-fn parse_json_object(body: &Bytes) -> Result<Value, Response> {
+fn parse_json_object(body: &Bytes) -> Result<Value, Box<Response>> {
     if body.is_empty() {
-        return Err(bad_request("request body must be a non-empty JSON object"));
+        return Err(Box::new(bad_request(
+            "request body must be a non-empty JSON object",
+        )));
     }
     let value: Value = serde_json::from_slice(body)
         .map_err(|err| EngineError::InvalidJson(err.to_string()))
-        .map_err(|err| engine_error_response(&err))?;
+        .map_err(|err| Box::new(engine_error_response(&err)))?;
     if !value.is_object() {
-        return Err(bad_request("request body must be a JSON object"));
+        return Err(Box::new(bad_request("request body must be a JSON object")));
     }
     Ok(value)
 }
@@ -593,7 +610,10 @@ fn json_response(status: StatusCode, value: &Value) -> Response {
 }
 
 pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    json_response(status, &json!({ "error": { "code": code, "message": message } }))
+    json_response(
+        status,
+        &json!({ "error": { "code": code, "message": message } }),
+    )
 }
 
 fn engine_error_response(err: &EngineError) -> Response {
@@ -641,10 +661,10 @@ mod tests {
     use crate::router::build_router;
     use axum::body::Body;
     use axum::http::Request;
-    use steadfast_core::EngineConfig;
-    use steadfast_storage::MemoryStore;
     use http_body_util::BodyExt;
     use std::sync::Arc;
+    use steadfast_core::EngineConfig;
+    use steadfast_storage::MemoryStore;
     use tower::ServiceExt;
 
     const TODO_SECRET: &str = "super_geheimes_todo_salt_123";
@@ -775,7 +795,12 @@ api_key_secret = "gallery_secret_456"
         builder.body(Body::empty()).unwrap()
     }
 
-    fn req_json(method: &str, uri: &str, headers: &[(&str, String)], body: &Value) -> Request<Body> {
+    fn req_json(
+        method: &str,
+        uri: &str,
+        headers: &[(&str, String)],
+        body: &Value,
+    ) -> Request<Body> {
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
@@ -895,7 +920,10 @@ api_key_secret = "gallery_secret_456"
         .await;
         assert_eq!(response.status(), StatusCode::CREATED);
         let doc = body_json(response).await;
-        assert_eq!(doc["created_by"], "anonymous", "unproven header must be ignored");
+        assert_eq!(
+            doc["created_by"], "anonymous",
+            "unproven header must be ignored"
+        );
 
         // Falsches X-Internal-Auth: dito.
         let mut headers = auth_headers("free");
@@ -913,7 +941,12 @@ api_key_secret = "gallery_secret_456"
         headers.push(("x-internal-auth", GW_SECRET.to_string()));
         let response = send(
             router.clone(),
-            req_json("POST", "/todo_app/tasks", &headers, &json!({"title": "prio", "is_priority": true})),
+            req_json(
+                "POST",
+                "/todo_app/tasks",
+                &headers,
+                &json!({"title": "prio", "is_priority": true}),
+            ),
         )
         .await;
         assert_eq!(response.status(), StatusCode::CREATED);
@@ -924,7 +957,12 @@ api_key_secret = "gallery_secret_456"
         // das Prioritaets-Skript lehnt die free-Default-Rolle mit 422 ab.
         let response = send(
             router.clone(),
-            req_json("POST", "/todo_app/tasks", &auth_headers("premium"), &json!({"title": "spoof", "is_priority": true})),
+            req_json(
+                "POST",
+                "/todo_app/tasks",
+                &auth_headers("premium"),
+                &json!({"title": "spoof", "is_priority": true}),
+            ),
         )
         .await;
         assert_eq!(
@@ -951,11 +989,7 @@ api_key_secret = "gallery_secret_456"
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let wrong = vec![("x-api-key", "wrong_key".to_string())];
-        let response = send(
-            app(),
-            req_json("POST", "/todo_app/tasks", &wrong, &body),
-        )
-        .await;
+        let response = send(app(), req_json("POST", "/todo_app/tasks", &wrong, &body)).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -970,10 +1004,12 @@ api_key_secret = "gallery_secret_456"
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let json = body_json(response).await;
         assert_eq!(json["error"]["code"], "script_rejected");
-        assert!(json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Premium"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Premium")
+        );
     }
 
     #[tokio::test]
@@ -1010,7 +1046,10 @@ api_key_secret = "gallery_secret_456"
         assert_eq!(json["status"], "offen");
         assert_eq!(json["title"], "Erste Aufgabe");
         assert!(!json["id"].as_str().unwrap().is_empty());
-        assert_eq!(location, format!("/todo_app/tasks/{}", json["id"].as_str().unwrap()));
+        assert_eq!(
+            location,
+            format!("/todo_app/tasks/{}", json["id"].as_str().unwrap())
+        );
     }
 
     #[tokio::test]
@@ -1041,7 +1080,10 @@ api_key_secret = "gallery_secret_456"
         let response = send(router.clone(), req("GET", "/todo_app/tasks/feste-id")).await;
         assert_eq!(response.status(), StatusCode::OK);
         let doc = body_json(response).await;
-        assert_eq!(doc["title"], "original", "409 darf den Bestand nicht anfassen");
+        assert_eq!(
+            doc["title"], "original",
+            "409 darf den Bestand nicht anfassen"
+        );
 
         let response = send(router, req("GET", "/todo_app/tasks")).await;
         let list = body_json(response).await;
@@ -1102,7 +1144,12 @@ api_key_secret = "gallery_secret_456"
     #[tokio::test]
     async fn list_returns_documents_with_paging_and_filter() {
         let router = app();
-        let roles = [("premium", true), ("free", false), ("free", false), ("free", false)];
+        let roles = [
+            ("premium", true),
+            ("free", false),
+            ("free", false),
+            ("free", false),
+        ];
         let mut ids = Vec::new();
         for (i, (role, priority)) in roles.iter().enumerate() {
             let body = json!({"title": format!("task {i}"), "is_priority": priority});
@@ -1112,7 +1159,12 @@ api_key_secret = "gallery_secret_456"
             )
             .await;
             assert_eq!(response.status(), StatusCode::CREATED);
-            ids.push(body_json(response).await["id"].as_str().unwrap().to_string());
+            ids.push(
+                body_json(response).await["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
         }
 
         // Paging: limit=2, page=1/2.
@@ -1166,7 +1218,10 @@ api_key_secret = "gallery_secret_456"
             req_json("POST", "/todo_app/tasks", &auth_headers("free"), &body),
         )
         .await;
-        let id = body_json(response).await["id"].as_str().unwrap().to_string();
+        let id = body_json(response).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let response = send(router.clone(), req("GET", &format!("/todo_app/tasks/{id}"))).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1186,7 +1241,10 @@ api_key_secret = "gallery_secret_456"
             req_json("POST", "/todo_app/tasks", &auth_headers("free"), &body),
         )
         .await;
-        let id = body_json(response).await["id"].as_str().unwrap().to_string();
+        let id = body_json(response).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let replacement = json!({"title": "neu", "id": "HACKED"});
         let response = send(
@@ -1235,7 +1293,10 @@ api_key_secret = "gallery_secret_456"
             req_json("POST", "/todo_app/tasks", &auth_headers("free"), &body),
         )
         .await;
-        let id = body_json(response).await["id"].as_str().unwrap().to_string();
+        let id = body_json(response).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let patch = json!({"status": "erledigt"});
         let response = send(
@@ -1250,7 +1311,10 @@ api_key_secret = "gallery_secret_456"
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let doc = body_json(response).await;
-        assert_eq!(doc["status"], "erledigt", "merge must preserve patched field");
+        assert_eq!(
+            doc["status"], "erledigt",
+            "merge must preserve patched field"
+        );
         assert_eq!(doc["title"], "original", "PATCH must merge, not replace");
         assert_eq!(doc["note"], "bleibt");
         assert_eq!(
@@ -1293,7 +1357,10 @@ api_key_secret = "gallery_secret_456"
             req_json("POST", "/todo_app/tasks", &auth_headers("free"), &body),
         )
         .await;
-        let id = body_json(response).await["id"].as_str().unwrap().to_string();
+        let id = body_json(response).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let response = send(
             router.clone(),
@@ -1372,7 +1439,12 @@ api_key_secret = "gallery_secret_456"
             let body = json!({"id": id, "album": album, "title": title, "taken": taken});
             let response = send(
                 router.clone(),
-                req_json("POST", "/gallery_app/photos", &[("x-api-key", GALLERY_SECRET.to_string())], &body),
+                req_json(
+                    "POST",
+                    "/gallery_app/photos",
+                    &[("x-api-key", GALLERY_SECRET.to_string())],
+                    &body,
+                ),
             )
             .await;
             assert_eq!(response.status(), StatusCode::CREATED);
@@ -1388,7 +1460,11 @@ api_key_secret = "gallery_secret_456"
         // Von-bis inklusive (album_min/album_max).
         let response = send(
             router.clone(),
-            req_auth("GET", "/gallery_app/photos?album_min=2&album_max=3", &headers),
+            req_auth(
+                "GET",
+                "/gallery_app/photos?album_min=2&album_max=3",
+                &headers,
+            ),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1558,7 +1634,11 @@ api_key_secret = "gallery_secret_456"
         // der GET-Antwort, aber kein Body.
         let router = app();
         let body = json!({"title": "fuer-head"});
-        send(router.clone(), req_json("POST", "/todo_app/tasks", &auth_headers("free"), &body)).await;
+        send(
+            router.clone(),
+            req_json("POST", "/todo_app/tasks", &auth_headers("free"), &body),
+        )
+        .await;
 
         let response = send(router.clone(), req("HEAD", "/todo_app/tasks")).await;
         assert_eq!(response.status(), StatusCode::OK);

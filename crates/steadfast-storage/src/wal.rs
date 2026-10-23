@@ -57,8 +57,10 @@ pub enum WalError {
     Io(#[from] io::Error),
     #[error("JSON-Fehler im Persistenzlayer: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("ununterstuetztes Dateiformat (Magic `{magic}`, Version {version}) in {path}: \
-             bitte Datenverzeichnis pruefen — es wird nicht automatisch geloescht")]
+    #[error(
+        "ununterstuetztes Dateiformat (Magic `{magic}`, Version {version}) in {path}: \
+             bitte Datenverzeichnis pruefen — es wird nicht automatisch geloescht"
+    )]
     UnsupportedFormat {
         magic: String,
         version: u16,
@@ -127,13 +129,15 @@ pub fn replay_data_dir_full(
                     });
                 }
                 Step::Record(body) => {
-                    let (app, collection, id, doc) = parse_snapshot_body(&body).map_err(|reason| {
-                        WalError::CorruptSnapshot {
+                    let (app, collection, id, doc) =
+                        parse_snapshot_body(&body).map_err(|reason| WalError::CorruptSnapshot {
                             path: snapshot_path.clone(),
                             reason,
-                        }
-                    })?;
-                    index.insert((app.clone(), collection.clone(), id.clone()), (pos, body.len() as u32));
+                        })?;
+                    index.insert(
+                        (app.clone(), collection.clone(), id.clone()),
+                        (pos, body.len() as u32),
+                    );
                     pos += 8 + body.len() as u64;
                     store.insert(&app, &collection, &id, doc);
                     step += 1;
@@ -185,7 +189,10 @@ fn replay_wal_file(
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     read_header(&mut reader, &WAL_MAGIC, path)?;
-    let mut result = FileReplay { records: 0, stopped_early: None };
+    let mut result = FileReplay {
+        records: 0,
+        stopped_early: None,
+    };
     let mut pos = HEADER_LEN;
     loop {
         match next_record(&mut reader)? {
@@ -195,14 +202,29 @@ fn replay_wal_file(
                 break;
             }
             Step::Record(body) => match parse_wal_body(&body) {
-                Ok(LoggedOp::Upsert { app, collection, id, doc }) => {
-                    index.insert((app.clone(), collection.clone(), id.clone()), (pos, body.len() as u32));
+                Ok(LoggedOp::Upsert {
+                    app,
+                    collection,
+                    id,
+                    doc,
+                }) => {
+                    index.insert(
+                        (app.clone(), collection.clone(), id.clone()),
+                        (pos, body.len() as u32),
+                    );
                     pos += 8 + body.len() as u64;
                     store.insert(&app, &collection, &id, doc);
                     result.records += 1;
                 }
-                Ok(LoggedOp::Delete { app, collection, id }) => {
-                    index.insert((app.clone(), collection.clone(), id.clone()), (pos, body.len() as u32));
+                Ok(LoggedOp::Delete {
+                    app,
+                    collection,
+                    id,
+                }) => {
+                    index.insert(
+                        (app.clone(), collection.clone(), id.clone()),
+                        (pos, body.len() as u32),
+                    );
                     pos += 8 + body.len() as u64;
                     store.delete(&app, &collection, &id);
                     result.records += 1;
@@ -225,7 +247,10 @@ fn wal_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(raw) = name.strip_prefix("wal-").and_then(|n| n.strip_suffix(".log")) else {
+        let Some(raw) = name
+            .strip_prefix("wal-")
+            .and_then(|n| n.strip_suffix(".log"))
+        else {
             continue;
         };
         if let Ok(epoch) = raw.parse::<u64>() {
@@ -372,14 +397,23 @@ fn put_kstr(buf: &mut Vec<u8>, s: &str) {
 pub fn encode_wal_op(out: &mut impl Write, op: &WalOp) -> io::Result<usize> {
     let mut body = Vec::with_capacity(96);
     match op {
-        WalOp::Upsert { app, collection, id, doc } => {
+        WalOp::Upsert {
+            app,
+            collection,
+            id,
+            doc,
+        } => {
             body.push(OP_UPSERT);
             put_kstr(&mut body, app);
             put_kstr(&mut body, collection);
             put_kstr(&mut body, id);
             serde_json::to_writer(&mut body, doc.as_ref())?;
         }
-        WalOp::Delete { app, collection, id } => {
+        WalOp::Delete {
+            app,
+            collection,
+            id,
+        } => {
             body.push(OP_DELETE);
             put_kstr(&mut body, app);
             put_kstr(&mut body, collection);
@@ -424,7 +458,8 @@ impl<'a> Cursor<'a> {
         if self.body.len() < self.pos + 4 {
             return Err("unerwartetes Record-Ende im Laengenpraefix".into());
         }
-        let len = u32::from_le_bytes(self.body[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+        let len =
+            u32::from_le_bytes(self.body[self.pos..self.pos + 4].try_into().unwrap()) as usize;
         self.pos += 4;
         if self.body.len() < self.pos + len {
             return Err("unerwartetes Record-Ende im String".into());
@@ -450,13 +485,22 @@ pub(crate) fn parse_wal_body(body: &[u8]) -> Result<LoggedOp, String> {
             let collection = cur.kstr()?;
             let id = cur.kstr()?;
             let doc = cur.json()?;
-            Ok(LoggedOp::Upsert { app, collection, id, doc })
+            Ok(LoggedOp::Upsert {
+                app,
+                collection,
+                id,
+                doc,
+            })
         }
         OP_DELETE => {
             let app = cur.kstr()?;
             let collection = cur.kstr()?;
             let id = cur.kstr()?;
-            Ok(LoggedOp::Delete { app, collection, id })
+            Ok(LoggedOp::Delete {
+                app,
+                collection,
+                id,
+            })
         }
         other => Err(format!("unbekannte Operation `{other}`")),
     }

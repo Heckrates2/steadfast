@@ -11,8 +11,8 @@ pub mod error;
 pub mod script;
 
 pub use config::{
-    AppConfigRuntime, EngineConfig, EndpointRuntime, HttpMethod, MAX_PAGE_SIZE,
-    MIN_API_KEY_SECRET_LEN,
+    AllowedOrigins, AppConfigRuntime, CorsConfig, EndpointRuntime, EngineConfig, HttpMethod,
+    MAX_CORS_MAX_AGE_SECS, MAX_PAGE_SIZE, MIN_API_KEY_SECRET_LEN,
 };
 pub use error::EngineError;
 pub use script::{CompiledScript, ScriptRuntime};

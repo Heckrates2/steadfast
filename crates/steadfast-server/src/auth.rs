@@ -84,7 +84,12 @@ pub fn extract_user(headers: &HeaderMap, identity_trusted: bool) -> serde_json::
         return json!({ "id": DEFAULT_USER_ID, "role": DEFAULT_USER_ROLE });
     }
     let id = header_string(headers, USER_ID_HEADER, DEFAULT_USER_ID, MAX_USER_ID_LEN);
-    let role = header_string(headers, USER_ROLE_HEADER, DEFAULT_USER_ROLE, MAX_USER_ROLE_LEN);
+    let role = header_string(
+        headers,
+        USER_ROLE_HEADER,
+        DEFAULT_USER_ROLE,
+        MAX_USER_ROLE_LEN,
+    );
     json!({ "id": id, "role": role })
 }
 
@@ -135,10 +140,7 @@ mod tests {
 
         // Leer = Default; zu lang = gekuerzt.
         headers.insert("x-user-id", "  ".parse().unwrap());
-        headers.insert(
-            "x-user-role",
-            "x".repeat(500).parse().unwrap(),
-        );
+        headers.insert("x-user-role", "x".repeat(500).parse().unwrap());
         let user = extract_user(&headers, true);
         assert_eq!(user["id"], json!("anonymous"));
         assert_eq!(user["role"].as_str().unwrap().len(), MAX_USER_ROLE_LEN);
@@ -180,8 +182,14 @@ mod tests {
 
     #[test]
     fn gateway_secret_must_match_exactly() {
-        assert!(verify_gateway_secret(Some("gateway-geheim"), "gateway-geheim"));
-        assert!(!verify_gateway_secret(Some("gateway-gehei"), "gateway-geheim"));
+        assert!(verify_gateway_secret(
+            Some("gateway-geheim"),
+            "gateway-geheim"
+        ));
+        assert!(!verify_gateway_secret(
+            Some("gateway-gehei"),
+            "gateway-geheim"
+        ));
         assert!(!verify_gateway_secret(None, "gateway-geheim"));
         assert!(!verify_gateway_secret(Some(""), "gateway-geheim"));
     }

@@ -249,11 +249,18 @@ impl MemoryStore {
         let fields = declared_fields(&inner);
         inner.by_id.insert(
             id.to_string(),
-            Stored { seq, data: Some(Arc::clone(&data)), access: AtomicU64::new(self.tick()) },
+            Stored {
+                seq,
+                data: Some(Arc::clone(&data)),
+                access: AtomicU64::new(self.tick()),
+            },
         );
         lock_seq_write(&inner.by_seq).insert(
             seq,
-            SeqSlot { id: id.to_string(), doc: Some(Arc::clone(&data)) },
+            SeqSlot {
+                id: id.to_string(),
+                doc: Some(Arc::clone(&data)),
+            },
         );
         if let Some((old_seq, old_doc)) = &old {
             match old_doc {
@@ -307,11 +314,18 @@ impl MemoryStore {
         let fields = declared_fields(&inner);
         inner.by_id.insert(
             id.to_string(),
-            Stored { seq, data: Some(Arc::clone(&data)), access: AtomicU64::new(self.tick()) },
+            Stored {
+                seq,
+                data: Some(Arc::clone(&data)),
+                access: AtomicU64::new(self.tick()),
+            },
         );
         lock_seq_write(&inner.by_seq).insert(
             seq,
-            SeqSlot { id: id.to_string(), doc: Some(Arc::clone(&data)) },
+            SeqSlot {
+                id: id.to_string(),
+                doc: Some(Arc::clone(&data)),
+            },
         );
         index_add(&inner, fields.as_ref(), seq, id, &data);
         self.log_wal(WalOp::Upsert {
@@ -333,7 +347,13 @@ impl MemoryStore {
     /// Ersetzt ein Dokument vollstaendig (`id` wird erzwungen). `None`, wenn
     /// die ID nicht existiert (kein Upsert). Gibt das NEUE Dokument zurueck;
     /// der alte Ordnungseintrag wandert ans Listenende (neue seq).
-    pub fn replace(&self, app: &str, collection: &str, id: &str, mut data: Value) -> Option<Arc<Value>> {
+    pub fn replace(
+        &self,
+        app: &str,
+        collection: &str,
+        id: &str,
+        mut data: Value,
+    ) -> Option<Arc<Value>> {
         let inner = self.collection_for_read(app, collection)?;
         if let Value::Object(map) = &mut data {
             map.insert("id".to_string(), Value::String(id.to_string()));
@@ -357,7 +377,10 @@ impl MemoryStore {
             order.remove(&old_seq);
             order.insert(
                 seq,
-                SeqSlot { id: id.to_string(), doc: Some(Arc::clone(&data)) },
+                SeqSlot {
+                    id: id.to_string(),
+                    doc: Some(Arc::clone(&data)),
+                },
             );
         }
         match old_doc {
@@ -462,7 +485,10 @@ impl MemoryStore {
             order.remove(&old_seq);
             order.insert(
                 seq,
-                SeqSlot { id: id.to_string(), doc: Some(Arc::clone(&merged)) },
+                SeqSlot {
+                    id: id.to_string(),
+                    doc: Some(Arc::clone(&merged)),
+                },
             );
         }
         index_remove(&inner, fields.as_ref(), old_seq, &current);
@@ -500,7 +526,12 @@ impl MemoryStore {
         let skip = (page - 1).saturating_mul(limit);
 
         let Some(inner) = self.collection_for_read(app, collection) else {
-            return ListResult { total: 0, page, limit, items: Vec::new() };
+            return ListResult {
+                total: 0,
+                page,
+                limit,
+                items: Vec::new(),
+            };
         };
 
         if params.ranges.is_empty() && params.sort.is_none() {
@@ -519,7 +550,12 @@ impl MemoryStore {
                     .into_iter()
                     .filter_map(|id| self.resolve_payload(&inner, app, collection, &id))
                     .collect();
-                return ListResult { total, page, limit, items };
+                return ListResult {
+                    total,
+                    page,
+                    limit,
+                    items,
+                };
             }
 
             if let Some(matched) = index_lookup(&inner, &params.filters) {
@@ -532,7 +568,12 @@ impl MemoryStore {
                     .take(limit)
                     .filter_map(|(_, id)| self.resolve_payload(&inner, app, collection, &id))
                     .collect();
-                return ListResult { total, page, limit, items };
+                return ListResult {
+                    total,
+                    page,
+                    limit,
+                    items,
+                };
             }
         }
 
@@ -552,7 +593,9 @@ impl MemoryStore {
                     let order = lock_seq_read(&inner.by_seq);
                     order
                         .iter()
-                        .map(|(seq, slot)| (*seq, slot.id.clone(), slot.doc.as_ref().map(Arc::clone)))
+                        .map(|(seq, slot)| {
+                            (*seq, slot.id.clone(), slot.doc.as_ref().map(Arc::clone))
+                        })
                         .collect()
                 }
             };
@@ -584,16 +627,32 @@ impl MemoryStore {
         if let Some(sort) = &params.sort {
             let descending = sort.descending;
             matched.sort_by(|(seq_a, doc_a), (seq_b, doc_b)| {
-                let primary =
-                    cmp_sort_values(doc_a.get(sort.field.as_str()), doc_b.get(sort.field.as_str()));
-                let primary = if descending { primary.reverse() } else { primary };
+                let primary = cmp_sort_values(
+                    doc_a.get(sort.field.as_str()),
+                    doc_b.get(sort.field.as_str()),
+                );
+                let primary = if descending {
+                    primary.reverse()
+                } else {
+                    primary
+                };
                 primary.then_with(|| seq_a.cmp(seq_b))
             });
         }
 
         let total = matched.len();
-        let items = matched.into_iter().skip(skip).take(limit).map(|(_, doc)| doc).collect();
-        ListResult { total, page, limit, items }
+        let items = matched
+            .into_iter()
+            .skip(skip)
+            .take(limit)
+            .map(|(_, doc)| doc)
+            .collect();
+        ListResult {
+            total,
+            page,
+            limit,
+            items,
+        }
     }
 
     /// Deklariert die sekundaer-indexierten Felder einer Kollektion (der
@@ -608,10 +667,7 @@ impl MemoryStore {
         let inner = self.collection_for_write(app, collection);
         let _write = lock_write(&inner.write);
         let set: Arc<BTreeSet<String>> = Arc::new(fields.iter().cloned().collect());
-        *inner
-            .declared
-            .write()
-            .expect("index declaration poisoned") = Arc::clone(&set);
+        *inner.declared.write().expect("index declaration poisoned") = Arc::clone(&set);
         // Backfill: Indizes fuer alle deklarierten Felder neu aus dem
         // Bestand aufbauen — pauschal, also verschwinden auch leere Buckets
         // einer frueheren Deklaration mit. Kalt dokuments gibt es hier nicht
@@ -624,10 +680,14 @@ impl MemoryStore {
             fresh.insert(field.clone(), HashMap::new());
         }
         for slot in inner.by_id.iter() {
-            let Some(doc) = slot.data.as_ref() else { continue };
+            let Some(doc) = slot.data.as_ref() else {
+                continue;
+            };
             for (field, map) in fresh.iter_mut() {
                 if let Some(key) = index_key_for_doc(doc.get(field)) {
-                    map.entry(key).or_default().insert(slot.seq, slot.key().clone());
+                    map.entry(key)
+                        .or_default()
+                        .insert(slot.seq, slot.key().clone());
                 }
             }
         }
@@ -688,7 +748,9 @@ impl MemoryStore {
     /// bleiben stehen — die Mutationen raeumen sie ueber die seq auf
     /// (siehe Moduldokumentation).
     fn ensure_hot(&self, inner: &CollectionInner, app: &str, collection: &str, id: &str) {
-        let Some(slot) = inner.by_id.get(id) else { return };
+        let Some(slot) = inner.by_id.get(id) else {
+            return;
+        };
         if inner.cold.load(Ordering::Relaxed) == 0 || slot.data.is_some() {
             return;
         }
@@ -720,7 +782,12 @@ impl MemoryStore {
         let doc = match tier.fetch(app, collection, id) {
             Ok(Some(doc)) => doc,
             Ok(None) => {
-                tracing::debug!(app, collection, id, "kaltes Dokument nicht im Kalt-Tier gefunden");
+                tracing::debug!(
+                    app,
+                    collection,
+                    id,
+                    "kaltes Dokument nicht im Kalt-Tier gefunden"
+                );
                 return None;
             }
             Err(err) => {
@@ -731,7 +798,7 @@ impl MemoryStore {
         // Promotieren — nur, wenn der Eintrag noch kalt ist.
         let _write = lock_write(&inner.write);
         let seq = {
-            let Some(mut slot) = inner.by_id.get_mut(id) else { return None };
+            let mut slot = inner.by_id.get_mut(id)?;
             if let Some(existing) = slot.data.as_ref() {
                 return Some(Arc::clone(existing));
             }
@@ -795,7 +862,9 @@ impl MemoryStore {
                     if inner.by_id.len().saturating_sub(cold_now) <= low_water {
                         break;
                     }
-                    let Some(mut slot) = inner.by_id.get_mut(&id) else { continue };
+                    let Some(mut slot) = inner.by_id.get_mut(&id) else {
+                        continue;
+                    };
                     if slot.data.is_none() || slot.seq > watermark {
                         continue;
                     }
@@ -836,7 +905,13 @@ impl MemoryStore {
                 .value()
                 .by_id
                 .iter()
-                .map(|slot| (slot.seq, slot.key().clone(), slot.data.as_ref().map(Arc::clone)))
+                .map(|slot| {
+                    (
+                        slot.seq,
+                        slot.key().clone(),
+                        slot.data.as_ref().map(Arc::clone),
+                    )
+                })
                 .collect();
             staged.sort_unstable_by_key(|(seq, _, _)| *seq);
             let mut entries = Vec::with_capacity(staged.len());
@@ -965,7 +1040,9 @@ fn index_remove_by_seq(inner: &CollectionInner, fields: &BTreeSet<String>, seq: 
     }
     let mut indexes = inner.indexes.write().expect("secondary indexes poisoned");
     for field in fields {
-        let Some(postings) = indexes.get_mut(field) else { continue };
+        let Some(postings) = indexes.get_mut(field) else {
+            continue;
+        };
         postings.retain(|_, bucket| {
             bucket.remove(&seq);
             !bucket.is_empty()
@@ -978,7 +1055,10 @@ fn index_remove_by_seq(inner: &CollectionInner, fields: &BTreeSet<String>, seq: 
 /// die Vereinigung aller moeglichen Wert-Schluessel gebildet (ein Rohwert
 /// kann je Dokumenttyp unterschiedliche Branches treffen), ueber Filter
 /// wird die Schnittmenge genommen. Ergebnis seq-aufsteigend sortiert.
-fn index_lookup(inner: &CollectionInner, filters: &[(String, String)]) -> Option<Vec<(u64, String)>> {
+fn index_lookup(
+    inner: &CollectionInner,
+    filters: &[(String, String)],
+) -> Option<Vec<(u64, String)>> {
     let fields = declared_fields(inner);
     if fields.is_empty() {
         return None;
@@ -1236,28 +1316,59 @@ mod tests {
     #[test]
     fn create_is_create_if_absent_and_reports_the_conflict() {
         let s = store();
-        let made = s.create("app", "tasks", "t1", json!({"title": "a"})).unwrap();
+        let made = s
+            .create("app", "tasks", "t1", json!({"title": "a"}))
+            .unwrap();
         assert_eq!(made["id"], json!("t1"));
         s.insert("app", "tasks", "t0", json!({"title": "zuerst"}));
 
         // Konflikt auf t1 (vorderster Listenposition): der Bestand bleibt
         // unveraendert — kein Upsert, keine neue seq, kein zweiter Eintrag.
         // Ein fehlgeleitetes Upsert wuerde t1 ans Ende ruecken.
-        let conflict = s.create("app", "tasks", "t1", json!({"title": "HACK"})).unwrap_err();
+        let conflict = s
+            .create("app", "tasks", "t1", json!({"title": "HACK"}))
+            .unwrap_err();
         assert_eq!(conflict.existing.unwrap()["title"], json!("a"));
         assert_eq!(s.get("app", "tasks", "t1").unwrap()["title"], json!("a"));
 
-        let list = s.list("app", "tasks", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None });
-        assert_eq!(list.total, 2, "Konflikt-Create darf weder duplizieren noch umordnen");
-        assert_eq!(list.items[0]["title"], json!("a"), "Konflikt darf keine seq ziehen");
+        let list = s.list(
+            "app",
+            "tasks",
+            ListParams {
+                page: 1,
+                limit: 10,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
+        assert_eq!(
+            list.total, 2,
+            "Konflikt-Create darf weder duplizieren noch umordnen"
+        );
+        assert_eq!(
+            list.items[0]["title"],
+            json!("a"),
+            "Konflikt darf keine seq ziehen"
+        );
         assert_eq!(list.items[1]["title"], json!("zuerst"));
     }
 
     #[test]
     fn patch_merge_commits_atomically_and_updates_indexes() {
         let s = store();
-        s.insert("app", "tasks", "t1", json!({"title": "a", "status": "offen"}));
-        s.insert("app", "tasks", "t2", json!({"title": "b", "status": "offen"}));
+        s.insert(
+            "app",
+            "tasks",
+            "t1",
+            json!({"title": "a", "status": "offen"}),
+        );
+        s.insert(
+            "app",
+            "tasks",
+            "t2",
+            json!({"title": "b", "status": "offen"}),
+        );
         s.declare_indexes("app", "tasks", &["status".to_string()]);
 
         let outcome = s.patch_merge("app", "tasks", "t1", |mut current| {
@@ -1274,11 +1385,29 @@ mod tests {
         };
         assert_eq!(doc["status"], json!("erledigt"));
         assert_eq!(doc["id"], json!("t1"), "die ID wird auf den Pfad erzwungen");
-        assert_eq!(doc["title"], json!("a"), "Merge muss den Reststand erhalten");
+        assert_eq!(
+            doc["title"],
+            json!("a"),
+            "Merge muss den Reststand erhalten"
+        );
 
         // Replace-Semantik fuer die Ordnung: wandert ans Listenende.
-        let list = s.list("app", "tasks", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None });
-        let ids: Vec<&str> = list.items.iter().map(|d| d["id"].as_str().unwrap()).collect();
+        let list = s.list(
+            "app",
+            "tasks",
+            ListParams {
+                page: 1,
+                limit: 10,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
+        let ids: Vec<&str> = list
+            .items
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, vec!["t2", "t1"]);
         // Und der Sekundaerindex folgt (kein Geistereintrag in "offen").
         let mut offen = s.list(
@@ -1309,8 +1438,22 @@ mod tests {
         // Keine neue seq: ein nachfolgender Insert bleibt hinter dem
         // unveraenderten Dokument.
         s.insert("app", "tasks", "t2", json!({"title": "b"}));
-        let list = s.list("app", "tasks", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None });
-        let ids: Vec<&str> = list.items.iter().map(|d| d["id"].as_str().unwrap()).collect();
+        let list = s.list(
+            "app",
+            "tasks",
+            ListParams {
+                page: 1,
+                limit: 10,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
+        let ids: Vec<&str> = list
+            .items
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, vec!["t1", "t2"]);
     }
 
@@ -1347,7 +1490,13 @@ mod tests {
         let page1 = s.list(
             "app",
             "tasks",
-            ListParams { page: 1, limit: 2, filters: vec![], ranges: Vec::new(), sort: None },
+            ListParams {
+                page: 1,
+                limit: 2,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
         );
         assert_eq!(page1.total, 5);
         assert_eq!(page1.items.len(), 2);
@@ -1356,7 +1505,13 @@ mod tests {
         let page3 = s.list(
             "app",
             "tasks",
-            ListParams { page: 3, limit: 2, filters: vec![], ranges: Vec::new(), sort: None },
+            ListParams {
+                page: 3,
+                limit: 2,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
         );
         assert_eq!(page3.items.len(), 1);
         assert_eq!(page3.items[0]["n"], json!(4));
@@ -1365,7 +1520,13 @@ mod tests {
         let page99 = s.list(
             "app",
             "tasks",
-            ListParams { page: 99, limit: 2, filters: vec![], ranges: Vec::new(), sort: None },
+            ListParams {
+                page: 99,
+                limit: 2,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
         );
         assert_eq!(page99.total, 5);
         assert!(page99.items.is_empty());
@@ -1377,17 +1538,45 @@ mod tests {
         s.insert("app", "tasks", "same", json!({"n": 1}));
         s.insert("app", "tasks", "same", json!({"n": 2}));
 
-        let list = s.list("app", "tasks", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None });
-        assert_eq!(list.total, 1, "doppelte Client-ID darf nicht doppelt auftauchen");
+        let list = s.list(
+            "app",
+            "tasks",
+            ListParams {
+                page: 1,
+                limit: 10,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
+        assert_eq!(
+            list.total, 1,
+            "doppelte Client-ID darf nicht doppelt auftauchen"
+        );
         assert_eq!(list.items[0]["n"], json!(2));
     }
 
     #[test]
     fn list_filters_by_equality_across_types() {
         let s = store();
-        s.insert("app", "tasks", "t1", json!({"status": "offen", "prio": 1, "flag": true}));
-        s.insert("app", "tasks", "t2", json!({"status": "erledigt", "prio": 2, "flag": false}));
-        s.insert("app", "tasks", "t3", json!({"status": "offen", "prio": 2.5}));
+        s.insert(
+            "app",
+            "tasks",
+            "t1",
+            json!({"status": "offen", "prio": 1, "flag": true}),
+        );
+        s.insert(
+            "app",
+            "tasks",
+            "t2",
+            json!({"status": "erledigt", "prio": 2, "flag": false}),
+        );
+        s.insert(
+            "app",
+            "tasks",
+            "t3",
+            json!({"status": "offen", "prio": 2.5}),
+        );
 
         let params = |filters: Vec<(&str, &str)>| {
             s.list(
@@ -1423,7 +1612,12 @@ mod tests {
     fn filtered_list_pages_like_unfiltered() {
         let s = store();
         for i in 0..5 {
-            s.insert("app", "tasks", &format!("t{i}"), json!({"n": i, "even": i % 2 == 0}));
+            s.insert(
+                "app",
+                "tasks",
+                &format!("t{i}"),
+                json!({"n": i, "even": i % 2 == 0}),
+            );
         }
 
         let list = s.list(
@@ -1449,10 +1643,66 @@ mod tests {
         s.insert("app2", "tasks", "t2", json!({}));
         s.insert("app1", "notes", "n1", json!({}));
 
-        assert_eq!(s.list("app1", "tasks", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None }).total, 1);
-        assert_eq!(s.list("app2", "tasks", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None }).total, 1);
-        assert_eq!(s.list("app1", "notes", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None }).total, 1);
-        assert_eq!(s.list("app3", "tasks", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None }).total, 0);
+        assert_eq!(
+            s.list(
+                "app1",
+                "tasks",
+                ListParams {
+                    page: 1,
+                    limit: 10,
+                    filters: vec![],
+                    ranges: Vec::new(),
+                    sort: None
+                }
+            )
+            .total,
+            1
+        );
+        assert_eq!(
+            s.list(
+                "app2",
+                "tasks",
+                ListParams {
+                    page: 1,
+                    limit: 10,
+                    filters: vec![],
+                    ranges: Vec::new(),
+                    sort: None
+                }
+            )
+            .total,
+            1
+        );
+        assert_eq!(
+            s.list(
+                "app1",
+                "notes",
+                ListParams {
+                    page: 1,
+                    limit: 10,
+                    filters: vec![],
+                    ranges: Vec::new(),
+                    sort: None
+                }
+            )
+            .total,
+            1
+        );
+        assert_eq!(
+            s.list(
+                "app3",
+                "tasks",
+                ListParams {
+                    page: 1,
+                    limit: 10,
+                    filters: vec![],
+                    ranges: Vec::new(),
+                    sort: None
+                }
+            )
+            .total,
+            0
+        );
     }
 
     #[test]
@@ -1462,8 +1712,22 @@ mod tests {
         s.insert("app", "tasks", "b", json!({"n": "b"}));
         s.replace("app", "tasks", "a", json!({"n": "a2"}));
 
-        let list = s.list("app", "tasks", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None });
-        assert_eq!(list.items[0]["n"], json!("b"), "replaced doc moves to the end");
+        let list = s.list(
+            "app",
+            "tasks",
+            ListParams {
+                page: 1,
+                limit: 10,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
+        assert_eq!(
+            list.items[0]["n"],
+            json!("b"),
+            "replaced doc moves to the end"
+        );
     }
 
     #[test]
@@ -1474,7 +1738,17 @@ mod tests {
         s.replace("app", "tasks", "a", json!({"n": "a2"}));
         s.delete("app", "tasks", "b");
 
-        let list = s.list("app", "tasks", ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None });
+        let list = s.list(
+            "app",
+            "tasks",
+            ListParams {
+                page: 1,
+                limit: 10,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
         assert_eq!(list.total, 1);
         assert_eq!(list.items[0]["n"], json!("a2"));
         assert!(s.get("app", "tasks", "b").is_none());
@@ -1501,7 +1775,18 @@ mod tests {
             handle.join().unwrap();
         }
         assert_eq!(
-            s.list("app", "tasks", ListParams { page: 1, limit: 1000, filters: vec![], ranges: Vec::new(), sort: None }).total,
+            s.list(
+                "app",
+                "tasks",
+                ListParams {
+                    page: 1,
+                    limit: 1000,
+                    filters: vec![],
+                    ranges: Vec::new(),
+                    sort: None
+                }
+            )
+            .total,
             400
         );
     }
@@ -1517,7 +1802,12 @@ mod tests {
                 for i in 0..100 {
                     let id = format!("w{worker}-{i}");
                     s.insert("app", "tasks", &id, json!({"worker": worker, "i": i}));
-                    s.replace("app", "tasks", &id, json!({"worker": worker, "i": i, "v2": true}));
+                    s.replace(
+                        "app",
+                        "tasks",
+                        &id,
+                        json!({"worker": worker, "i": i, "v2": true}),
+                    );
                     if i % 2 == 0 {
                         s.delete("app", "tasks", &id);
                     }
@@ -1528,7 +1818,17 @@ mod tests {
             handle.join().unwrap();
         }
 
-        let list = s.list("app", "tasks", ListParams { page: 1, limit: 1000, filters: vec![], ranges: Vec::new(), sort: None });
+        let list = s.list(
+            "app",
+            "tasks",
+            ListParams {
+                page: 1,
+                limit: 1000,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
         // 4 x 50 uebrig gebliebene IDs + der Anker.
         assert_eq!(list.total, 201);
         // Jedes uebrig gebliebene Worker-Dokument ist per ID auffindbar und
@@ -1610,14 +1910,44 @@ mod tests {
     }
 
     fn seed_mixed_docs(s: &MemoryStore) {
-        s.insert("app", "tasks", "a", json!({"status": "offen", "prio": 1, "flag": true}));
-        s.insert("app", "tasks", "b", json!({"status": "erledigt", "prio": 2, "flag": false}));
+        s.insert(
+            "app",
+            "tasks",
+            "a",
+            json!({"status": "offen", "prio": 1, "flag": true}),
+        );
+        s.insert(
+            "app",
+            "tasks",
+            "b",
+            json!({"status": "erledigt", "prio": 2, "flag": false}),
+        );
         s.insert("app", "tasks", "c", json!({"status": "offen", "prio": 2.5}));
         s.insert("app", "tasks", "d", json!({"status": 1, "prio": -7}));
-        s.insert("app", "tasks", "e", json!({"status": "1", "big": 9223372036854775808u64}));
-        s.insert("app", "tasks", "f", json!({"status": "offen", "meta": {"nested": 1}}));
-        s.insert("app", "tasks", "g", json!({"prio": 2, "flag": false, "status": null}));
-        s.insert("app", "tasks", "h", json!({"status": "offen", "prio": 9223372036854775807i64}));
+        s.insert(
+            "app",
+            "tasks",
+            "e",
+            json!({"status": "1", "big": 9223372036854775808u64}),
+        );
+        s.insert(
+            "app",
+            "tasks",
+            "f",
+            json!({"status": "offen", "meta": {"nested": 1}}),
+        );
+        s.insert(
+            "app",
+            "tasks",
+            "g",
+            json!({"prio": 2, "flag": false, "status": null}),
+        );
+        s.insert(
+            "app",
+            "tasks",
+            "h",
+            json!({"status": "offen", "prio": 9223372036854775807i64}),
+        );
     }
 
     #[test]
@@ -1629,7 +1959,13 @@ mod tests {
         indexed.declare_indexes(
             "app",
             "tasks",
-            &["status".to_string(), "prio".to_string(), "flag".to_string(), "big".to_string(), "meta".to_string()],
+            &[
+                "status".to_string(),
+                "prio".to_string(),
+                "flag".to_string(),
+                "big".to_string(),
+                "meta".to_string(),
+            ],
         );
 
         for filters in filter_battery() {
@@ -1667,23 +2003,44 @@ mod tests {
     fn indexed_list_pages_in_seq_order() {
         let s = store();
         for i in 0..10 {
-            s.insert("app", "tasks", &format!("t{i}"), json!({"bucket": i % 3, "n": i}));
+            s.insert(
+                "app",
+                "tasks",
+                &format!("t{i}"),
+                json!({"bucket": i % 3, "n": i}),
+            );
         }
         s.declare_indexes("app", "tasks", &["bucket".to_string()]);
 
         let page1 = s.list(
             "app",
             "tasks",
-            ListParams { page: 1, limit: 2, filters: vec![("bucket".to_string(), "0".to_string())], ranges: Vec::new(), sort: None },
+            ListParams {
+                page: 1,
+                limit: 2,
+                filters: vec![("bucket".to_string(), "0".to_string())],
+                ranges: Vec::new(),
+                sort: None,
+            },
         );
         assert_eq!(page1.total, 4);
-        let nums: Vec<i64> = page1.items.iter().map(|d| d["n"].as_i64().unwrap()).collect();
+        let nums: Vec<i64> = page1
+            .items
+            .iter()
+            .map(|d| d["n"].as_i64().unwrap())
+            .collect();
         assert_eq!(nums, vec![0, 3], "Index-Treffer folgen der seq-Ordnung");
 
         let page3 = s.list(
             "app",
             "tasks",
-            ListParams { page: 3, limit: 2, filters: vec![("bucket".to_string(), "0".to_string())], ranges: Vec::new(), sort: None },
+            ListParams {
+                page: 3,
+                limit: 2,
+                filters: vec![("bucket".to_string(), "0".to_string())],
+                ranges: Vec::new(),
+                sort: None,
+            },
         );
         assert_eq!(page3.items.len(), 0, "Seite hinter dem Ende bleibt leer");
         assert_eq!(page3.total, 4);
@@ -1716,7 +2073,10 @@ mod tests {
         assert_eq!(list_ids(&s, &[("status", "erledigt")]), vec!["a"]);
 
         s.delete("app", "tasks", "a");
-        assert_eq!(list_ids(&s, &[("status", "erledigt")]), Vec::<String>::new());
+        assert_eq!(
+            list_ids(&s, &[("status", "erledigt")]),
+            Vec::<String>::new()
+        );
         assert_eq!(list_ids(&s, &[("status", "offen")]), Vec::<String>::new());
     }
 
@@ -1740,7 +2100,10 @@ mod tests {
         // "tag" ist nicht deklariert — das Ergebnis muss trotzdem korrekt sein
         // (Scan-Fallback statt Index).
         assert_eq!(list_ids(&s, &[("tag", "y")]), vec!["b"]);
-        assert_eq!(list_ids(&s, &[("tag", "x"), ("status", "offen")]), vec!["a"]);
+        assert_eq!(
+            list_ids(&s, &[("tag", "x"), ("status", "offen")]),
+            vec!["a"]
+        );
     }
 
     #[test]
@@ -1749,7 +2112,11 @@ mod tests {
         s.declare_indexes("app", "tasks", &["status".to_string()]);
         s.insert("app", "tasks", "a", json!({"status": "offen"}));
         s.declare_indexes("app", "tasks", &[]);
-        assert_eq!(list_ids(&s, &[("status", "offen")]), vec!["a"], "Scan liefert weiter korrekte Treffer");
+        assert_eq!(
+            list_ids(&s, &[("status", "offen")]),
+            vec!["a"],
+            "Scan liefert weiter korrekte Treffer"
+        );
     }
 
     #[test]
@@ -1795,7 +2162,11 @@ mod tests {
             0,
             "nach Replace + Delete bleibt nichts in Phase 1 haengen"
         );
-        assert_eq!(params(vec![("phase", "2")]).total, 201, "4 x 50 Worker-Dokumente + Anker");
+        assert_eq!(
+            params(vec![("phase", "2")]).total,
+            201,
+            "4 x 50 Worker-Dokumente + Anker"
+        );
         assert_eq!(params(vec![("worker", "1"), ("phase", "2")]).total, 50);
     }
 
@@ -1818,14 +2189,31 @@ mod tests {
 
         // Liste bleibt vollstaendig: Totals stabil, kalte Seiten-Payloads
         // werden transparent nachgeladen.
-        let list = s.list("app", "tasks", ListParams { page: 1, limit: 100, filters: vec![], ranges: Vec::new(), sort: None });
+        let list = s.list(
+            "app",
+            "tasks",
+            ListParams {
+                page: 1,
+                limit: 100,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
         assert_eq!(list.total, 10);
-        let ns: Vec<i64> = list.items.iter().map(|d| d["n"].as_i64().unwrap()).collect();
+        let ns: Vec<i64> = list
+            .items
+            .iter()
+            .map(|d| d["n"].as_i64().unwrap())
+            .collect();
         assert_eq!(ns, (0..10).collect::<Vec<_>>());
 
         // Paging durch alles = alles promotet.
         let (_, cold_after) = s.hot_doc_counts("app", "tasks").unwrap();
-        assert_eq!(cold_after, 0, "vollstaendiges Lesen muss alles heiss machen");
+        assert_eq!(
+            cold_after, 0,
+            "vollstaendiges Lesen muss alles heiss machen"
+        );
     }
 
     #[test]
@@ -1838,11 +2226,23 @@ mod tests {
         s.insert("app", "tasks", "t3", json!({"n": "drei"}));
         attach_snapshot_tier(&s, dir.path());
         s.run_eviction();
-        assert_eq!(s.hot_doc_counts("app", "tasks").unwrap().1, 1, "t1 als aeltester kalt");
+        assert_eq!(
+            s.hot_doc_counts("app", "tasks").unwrap().1,
+            1,
+            "t1 als aeltester kalt"
+        );
 
         let doc = s.get("app", "tasks", "t1").unwrap();
-        assert_eq!(doc["n"], json!("eins"), "Payload muss aus dem Kalt-Tier kommen");
-        assert_eq!(s.hot_doc_counts("app", "tasks").unwrap().1, 0, "Fetch muss promotieren");
+        assert_eq!(
+            doc["n"],
+            json!("eins"),
+            "Payload muss aus dem Kalt-Tier kommen"
+        );
+        assert_eq!(
+            s.hot_doc_counts("app", "tasks").unwrap().1,
+            0,
+            "Fetch muss promotieren"
+        );
     }
 
     #[test]
@@ -1853,7 +2253,12 @@ mod tests {
         s.set_hot_cap(3);
         for i in 0..10 {
             let status = if i % 2 == 0 { "offen" } else { "erledigt" };
-            s.insert("app", "tasks", &format!("t{i}"), json!({"n": i, "status": status}));
+            s.insert(
+                "app",
+                "tasks",
+                &format!("t{i}"),
+                json!({"n": i, "status": status}),
+            );
         }
         attach_snapshot_tier(&s, dir.path());
         s.run_eviction();
@@ -1877,7 +2282,11 @@ mod tests {
         assert_eq!(list.items[0]["n"], json!(0));
         assert_eq!(list.items[1]["n"], json!(2));
         let cold_after = s.hot_doc_counts("app", "tasks").unwrap().1;
-        assert_eq!(cold_after, cold_before - 2, "nur die zwei Seiten-Payloads werden geladen");
+        assert_eq!(
+            cold_after,
+            cold_before - 2,
+            "nur die zwei Seiten-Payloads werden geladen"
+        );
     }
 
     #[test]
@@ -1892,7 +2301,10 @@ mod tests {
         s.dump_collections().unwrap();
         s.run_eviction();
         assert_eq!(s.hot_doc_counts("app", "tasks").unwrap().1, 2);
-        assert!(s.dump_collections().is_err(), "kalte Docs ohne Tier muessen den Dump abbrechen");
+        assert!(
+            s.dump_collections().is_err(),
+            "kalte Docs ohne Tier muessen den Dump abbrechen"
+        );
 
         // Tier angehaengt, aber leer: ebenfalls Fehler statt stiller Luecke.
         s.set_cold(Arc::new(ColdTier::new()));
@@ -1912,7 +2324,12 @@ mod tests {
         let seed = |s: &MemoryStore| {
             for i in 0..6 {
                 let status = if i % 2 == 0 { "offen" } else { "erledigt" };
-                s.insert("app", "tasks", &format!("t{i}"), json!({"n": i, "status": status, "prio": i}));
+                s.insert(
+                    "app",
+                    "tasks",
+                    &format!("t{i}"),
+                    json!({"n": i, "status": status, "prio": i}),
+                );
             }
         };
         seed(&scanned);
@@ -1926,9 +2343,20 @@ mod tests {
         // Replace (Feldwert aendert sich), Delete und Insert-Overwrite auf
         // kalten Dokumenten — beide Pfade muessen identisch landen.
         let mutations = |s: &MemoryStore| {
-            s.replace("app", "tasks", "t0", json!({"n": 0, "status": "erledigt", "prio": 0})).unwrap();
+            s.replace(
+                "app",
+                "tasks",
+                "t0",
+                json!({"n": 0, "status": "erledigt", "prio": 0}),
+            )
+            .unwrap();
             s.delete("app", "tasks", "t1").unwrap();
-            s.insert("app", "tasks", "t2", json!({"n": "neu", "status": "offen", "prio": 42}));
+            s.insert(
+                "app",
+                "tasks",
+                "t2",
+                json!({"n": "neu", "status": "offen", "prio": 42}),
+            );
         };
         mutations(&scanned);
         mutations(&indexed);
@@ -1984,11 +2412,31 @@ mod tests {
     // --- Range-Filter (von/bis) und Sortierung -----------------------------------
 
     fn seed_range_docs(s: &MemoryStore) {
-        s.insert("app", "tasks", "a", json!({"n": 5, "name": "apfel", "when": "2024-01-01"}));
-        s.insert("app", "tasks", "b", json!({"n": 10, "name": "birne", "when": "2024-06-15"}));
-        s.insert("app", "tasks", "c", json!({"n": 2.5, "name": "cashew", "when": "2023-12-31"}));
+        s.insert(
+            "app",
+            "tasks",
+            "a",
+            json!({"n": 5, "name": "apfel", "when": "2024-01-01"}),
+        );
+        s.insert(
+            "app",
+            "tasks",
+            "b",
+            json!({"n": 10, "name": "birne", "when": "2024-06-15"}),
+        );
+        s.insert(
+            "app",
+            "tasks",
+            "c",
+            json!({"n": 2.5, "name": "cashew", "when": "2023-12-31"}),
+        );
         s.insert("app", "tasks", "d", json!({"n": -3, "flag": true}));
-        s.insert("app", "tasks", "e", json!({"n": "sieben", "nested": {"x": 1}}));
+        s.insert(
+            "app",
+            "tasks",
+            "e",
+            json!({"n": "sieben", "nested": {"x": 1}}),
+        );
         s.insert("app", "tasks", "f", json!({"n": null}));
     }
 
@@ -1998,9 +2446,18 @@ mod tests {
         seed_range_docs(&s);
 
         // Zahlen: _min/_max inklusive, _gt/_lt exklusiv (hier direkt als Ops).
-        assert_eq!(query_ids(&s, &[], &[("n", RangeOp::Gte, "5")], None), vec!["a", "b"]);
-        assert_eq!(query_ids(&s, &[], &[("n", RangeOp::Lte, "5")], None), vec!["a", "c", "d"]);
-        assert_eq!(query_ids(&s, &[], &[("n", RangeOp::Gt, "5")], None), vec!["b"]);
+        assert_eq!(
+            query_ids(&s, &[], &[("n", RangeOp::Gte, "5")], None),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            query_ids(&s, &[], &[("n", RangeOp::Lte, "5")], None),
+            vec!["a", "c", "d"]
+        );
+        assert_eq!(
+            query_ids(&s, &[], &[("n", RangeOp::Gt, "5")], None),
+            vec!["b"]
+        );
         assert_eq!(
             query_ids(&s, &[], &[("n", RangeOp::Lt, "2.5")], None),
             vec!["d"],
@@ -2017,26 +2474,49 @@ mod tests {
         );
 
         // Strings: Byte-lexikographisch — ISO-Daten sortieren damit korrekt.
-        assert_eq!(query_ids(&s, &[], &[("name", RangeOp::Gt, "apfel")], None), vec!["b", "c"]);
+        assert_eq!(
+            query_ids(&s, &[], &[("name", RangeOp::Gt, "apfel")], None),
+            vec!["b", "c"]
+        );
         assert_eq!(
             query_ids(
                 &s,
                 &[],
-                &[("when", RangeOp::Gte, "2024-01-01"), ("when", RangeOp::Lte, "2024-12-31")],
+                &[
+                    ("when", RangeOp::Gte, "2024-01-01"),
+                    ("when", RangeOp::Lte, "2024-12-31")
+                ],
                 None
             ),
             vec!["a", "b"]
         );
 
         // Bools/Objekte/null/fehlende Felder sind nicht bereichsfaehig.
-        assert_eq!(query_ids(&s, &[], &[("flag", RangeOp::Gte, "true")], None), Vec::<String>::new());
-        assert_eq!(query_ids(&s, &[], &[("nested", RangeOp::Gte, "1")], None), Vec::<String>::new());
-        assert_eq!(query_ids(&s, &[], &[("missing", RangeOp::Gte, "1")], None), Vec::<String>::new());
+        assert_eq!(
+            query_ids(&s, &[], &[("flag", RangeOp::Gte, "true")], None),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            query_ids(&s, &[], &[("nested", RangeOp::Gte, "1")], None),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            query_ids(&s, &[], &[("missing", RangeOp::Gte, "1")], None),
+            Vec::<String>::new()
+        );
         // Typ-Strengtheit: String-Dokumente nehmen an numerischen Bereichen
         // nicht teil und umgekehrt ("sieben" ist keine 7).
-        assert_eq!(query_ids(&s, &[], &[("n", RangeOp::Gte, "a")], None), vec!["e"]);
         assert_eq!(
-            query_ids(&s, &[], &[("n", RangeOp::Gte, "0"), ("n", RangeOp::Lte, "100")], None),
+            query_ids(&s, &[], &[("n", RangeOp::Gte, "a")], None),
+            vec!["e"]
+        );
+        assert_eq!(
+            query_ids(
+                &s,
+                &[],
+                &[("n", RangeOp::Gte, "0"), ("n", RangeOp::Lte, "100")],
+                None
+            ),
             vec!["a", "b", "c"]
         );
     }
@@ -2052,7 +2532,16 @@ mod tests {
         // Injection-artiger Rohwerte, die wie jede andere Zeichenkette am
         // Parse scheitern. Es gibt keine Ausdruckssprache, die man truken
         // koennte: verglichen wird nur.
-        for bound in ["NaN", "inf", "-inf", "1e400", "0x10", "5) OR (1=1", "5; DROP tasks", "5' --"] {
+        for bound in [
+            "NaN",
+            "inf",
+            "-inf",
+            "1e400",
+            "0x10",
+            "5) OR (1=1",
+            "5; DROP tasks",
+            "5' --",
+        ] {
             assert_eq!(
                 query_ids(&s, &[], &[("n", RangeOp::Gte, bound)], None),
                 Vec::<String>::new(),
@@ -2116,7 +2605,10 @@ mod tests {
                     limit: 3,
                     filters: vec![],
                     ranges: Vec::new(),
-                    sort: Some(SortSpec { field: "n".to_string(), descending: false }),
+                    sort: Some(SortSpec {
+                        field: "n".to_string(),
+                        descending: false,
+                    }),
                 },
             );
             assert_eq!(list.total, 10, "total bleibt ueber alle Seiten stabil");
@@ -2134,7 +2626,10 @@ mod tests {
                     limit: 3,
                     filters: vec![],
                     ranges: Vec::new(),
-                    sort: Some(SortSpec { field: "n".to_string(), descending: true }),
+                    sort: Some(SortSpec {
+                        field: "n".to_string(),
+                        descending: true,
+                    }),
                 },
             );
             desc_pages.extend(list.items.iter().map(|d| d["n"].as_i64().unwrap()));

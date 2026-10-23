@@ -3,8 +3,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use steadfast_core::{EngineConfig, EndpointRuntime, EngineError, HttpMethod};
+use steadfast_core::{CorsConfig, EndpointRuntime, EngineConfig, EngineError, HttpMethod};
 use steadfast_storage::MemoryStore;
 
 /// Alle Endpunkte eines konfigurierten Pfades einer App, nach HTTP-Methode.
@@ -24,10 +25,12 @@ impl PathRoutes {
     }
 }
 
-/// Eine App: optionales API-Key-Secret plus Pfad -> Endpunkt-Tabellen.
+/// Eine App: optionales API-Key-Secret, optionale CORS-Regeln plus
+/// Pfad -> Endpunkt-Tabellen.
 #[derive(Debug, Default)]
 pub struct AppRoutes {
     secret: Option<Arc<str>>,
+    cors: Option<Arc<CorsConfig>>,
     paths: HashMap<String, PathRoutes>,
 }
 
@@ -38,6 +41,13 @@ impl AppRoutes {
 
     pub fn secret(&self) -> Option<&str> {
         self.secret.as_deref()
+    }
+
+    /// CORS-Regeln der App (`None` = keine `[cors]`-Sektion konfiguriert —
+    /// Requests werden dann von der CORS-Middleware unangetastet
+    /// durchgereicht).
+    pub fn cors(&self) -> Option<&CorsConfig> {
+        self.cors.as_deref()
     }
 }
 
@@ -56,6 +66,10 @@ struct Inner {
     /// der Betreiber, werden `X-User-*`-Header nur noch honoring, wenn der
     /// Request per `X-Internal-Auth` seine Herkunft vom Gateway belegt.
     gateway_secret: Option<Arc<str>>,
+    /// gzip-Komprimierung von JSON-Antworten (default an, `--no-compression`
+    /// schaltet ab). AtomicBool, damit `main` den Schalter nach dem Build
+    /// umlegen kann, ohne den Konstruktor-Signatur aller Tests zu aendern.
+    compression_enabled: AtomicBool,
 }
 
 impl std::fmt::Debug for AppState {
@@ -100,8 +114,11 @@ impl AppState {
                 // haeufigste Fehlkonfiguration (Default ist false) — beim
                 // Start laut sichtbar machen, statt sie still zu erlauben.
                 if endpoint.method != HttpMethod::Get && !endpoint.auth_required {
-                    unauthenticated_writes
-                        .push(format!("{} {}", endpoint.method.as_str(), endpoint.path));
+                    unauthenticated_writes.push(format!(
+                        "{} {}",
+                        endpoint.method.as_str(),
+                        endpoint.path
+                    ));
                 }
                 if endpoint.method == HttpMethod::Get {
                     if let Some(fields) = &endpoint.filter_fields {
@@ -135,6 +152,7 @@ impl AppState {
                 app_id,
                 AppRoutes {
                     secret: app.api_key_secret,
+                    cors: app.cors,
                     paths,
                 },
             );
@@ -145,6 +163,7 @@ impl AppState {
                 apps,
                 store,
                 gateway_secret: gateway_secret.map(Into::into),
+                compression_enabled: AtomicBool::new(true),
             }),
         })
     }
@@ -164,6 +183,19 @@ impl AppState {
         self.inner.gateway_secret.as_deref()
     }
 
+    /// Schaltet die gzip-Komprimierung ab (`--no-compression`). Vor
+    /// `build_router` aufrufen — der Router liest den Schalter beim Aufbau.
+    pub fn set_compression_enabled(&self, enabled: bool) {
+        self.inner
+            .compression_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Ist die gzip-Komprimierung aktiv? (Default: ja.)
+    pub fn compression_enabled(&self) -> bool {
+        self.inner.compression_enabled.load(Ordering::Relaxed)
+    }
+
     /// (Anzahl Apps, Anzahl Endpunkte) fuer Startup-Logging.
     pub fn summary(&self) -> (usize, usize) {
         let apps = self.inner.apps.len();
@@ -180,8 +212,8 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use steadfast_storage::ListParams;
     use serde_json::json;
+    use steadfast_storage::ListParams;
 
     const TEST_TOML: &str = r#"
 [apps.todo_app]
@@ -203,9 +235,18 @@ api_key_secret = "test_secret_123_geheim"
         let list = state.store().list(
             "todo_app",
             "tasks",
-            ListParams { page: 1, limit: 10, filters: vec![], ranges: Vec::new(), sort: None },
+            ListParams {
+                page: 1,
+                limit: 10,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
         );
-        assert_eq!(list.total, 1, "Replay-Vorfuellung muss im Hot Path sichtbar sein");
+        assert_eq!(
+            list.total, 1,
+            "Replay-Vorfuellung muss im Hot Path sichtbar sein"
+        );
     }
 
     #[test]
@@ -213,8 +254,18 @@ api_key_secret = "test_secret_123_geheim"
         // Vorfuellung wie beim Replay: der Backfill in build_with_store muss
         // die Bestand dokumente in die deklarierten Indizes uebernehmen.
         let store = Arc::new(MemoryStore::new());
-        store.insert("todo_app", "tasks", "t1", json!({"title": "a", "status": "offen"}));
-        store.insert("todo_app", "tasks", "t2", json!({"title": "b", "status": "erledigt"}));
+        store.insert(
+            "todo_app",
+            "tasks",
+            "t1",
+            json!({"title": "a", "status": "offen"}),
+        );
+        store.insert(
+            "todo_app",
+            "tasks",
+            "t2",
+            json!({"title": "b", "status": "erledigt"}),
+        );
 
         let config = EngineConfig::from_toml(
             r#"

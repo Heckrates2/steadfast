@@ -27,6 +27,6 @@ pub use store::{
 // Encode-/Header-Helfer sind oeffentlich, damit Werkzeuge (Backups,
 // Migrationen) gueltige WAL-Segmente und Snapshots schreiben koennen.
 pub use wal::{
-    WAL_MAGIC, ReplayReport, WalError, WalOp, encode_wal_op, replay_data_dir, replay_data_dir_full,
+    ReplayReport, WAL_MAGIC, WalError, WalOp, encode_wal_op, replay_data_dir, replay_data_dir_full,
     wal_file_path, write_file_header, write_snapshot_file,
 };

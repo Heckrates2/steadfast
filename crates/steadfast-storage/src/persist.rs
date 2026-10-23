@@ -133,9 +133,19 @@ impl Persistence {
         let cfg = config.clone();
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let worker_flag = Arc::clone(&shutdown_flag);
-        let worker = std::thread::Builder::new().name("wal-worker".into()).spawn(move || {
-            worker_loop(worker_store, receiver, cfg, writer, start_offset, cold, worker_flag)
-        })?;
+        let worker = std::thread::Builder::new()
+            .name("wal-worker".into())
+            .spawn(move || {
+                worker_loop(
+                    worker_store,
+                    receiver,
+                    cfg,
+                    writer,
+                    start_offset,
+                    cold,
+                    worker_flag,
+                )
+            })?;
 
         Ok(Persistence {
             worker: Some(worker),
@@ -171,10 +181,17 @@ fn write_record(
     op: &WalOp,
 ) -> u64 {
     let key = match op {
-        WalOp::Upsert { app, collection, id, .. }
-        | WalOp::Delete { app, collection, id } => {
-            (app.clone(), collection.clone(), id.clone())
+        WalOp::Upsert {
+            app,
+            collection,
+            id,
+            ..
         }
+        | WalOp::Delete {
+            app,
+            collection,
+            id,
+        } => (app.clone(), collection.clone(), id.clone()),
     };
     match wal::encode_wal_op(writer, op) {
         Ok(n) => {
@@ -315,7 +332,9 @@ fn worker_loop(
     // letzter Stand als Snapshot sichern.
     match snapshot_now(&store, &cfg.data_dir, &cold) {
         Ok(docs) => tracing::info!(docs, "finaler Snapshot beim Herunterfahren geschrieben"),
-        Err(err) => tracing::error!(%err, "finaler Snapshot fehlgeschlagen — WAL bleibt massgeblich"),
+        Err(err) => {
+            tracing::error!(%err, "finaler Snapshot fehlgeschlagen — WAL bleibt massgeblich")
+        }
     }
     let _ = writer.flush();
     let _ = writer.get_ref().wal_sync();
@@ -402,8 +421,8 @@ fn acquire_data_dir_lock(dir: &Path) -> io::Result<File> {
         // "Bereits gesperrt" kommt plattformverschieden an: WouldBlock
         // (Unix flock) oder der rohe Windows-Code 33 (ERROR_LOCK_VIOLATION,
         // von std als Uncategorized durchgereicht).
-        let already_locked = err.kind() == io::ErrorKind::WouldBlock
-            || err.raw_os_error() == Some(33);
+        let already_locked =
+            err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(33);
         return Err(if already_locked {
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -445,10 +464,15 @@ fn delete_segments_before(dir: &Path, epoch: u64) {
         for entry in segments.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(raw) = name.strip_prefix("wal-").and_then(|n| n.strip_suffix(".log")) else {
+            let Some(raw) = name
+                .strip_prefix("wal-")
+                .and_then(|n| n.strip_suffix(".log"))
+            else {
                 continue;
             };
-            let Ok(segment_epoch) = raw.parse::<u64>() else { continue };
+            let Ok(segment_epoch) = raw.parse::<u64>() else {
+                continue;
+            };
             if segment_epoch < epoch {
                 // Best effort: Inhalt ist zu diesem Zeitpunkt im Snapshot
                 // bzw. im neuen Segment; ein Fehlschlag kostet nur Platz.
@@ -516,7 +540,11 @@ mod tests {
         // damit das Replay am Ende die Records lesen kann) — der FaultyWriter
         // braucht das rohe File, open_wal_segment boxt dagegen schon.
         let active_path = wal::wal_file_path(dir.path(), 1);
-        let file = OpenOptions::new().create(true).append(true).open(&active_path).unwrap();
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active_path)
+            .unwrap();
         let mut header = BufWriter::new(file);
         wal::write_file_header(&mut header, &wal::WAL_MAGIC).unwrap();
         header.flush().unwrap();
@@ -544,7 +572,10 @@ mod tests {
                 cfg,
                 BufWriter::with_capacity(
                     4096,
-                    Box::new(FaultyWriter { file, fail: worker_fail }) as Box<dyn WalSink + Send>,
+                    Box::new(FaultyWriter {
+                        file,
+                        fail: worker_fail,
+                    }) as Box<dyn WalSink + Send>,
                 ),
                 start_offset,
                 worker_cold,

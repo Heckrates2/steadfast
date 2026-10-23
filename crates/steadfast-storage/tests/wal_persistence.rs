@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::json;
 use steadfast_storage::{
-    WAL_MAGIC, ColdTier, ListParams, MemoryStore, Persistence, PersistenceConfig, WalOp,
+    ColdTier, ListParams, MemoryStore, Persistence, PersistenceConfig, WAL_MAGIC, WalOp,
     encode_wal_op, replay_data_dir, replay_data_dir_full, wal_file_path, write_file_header,
     write_snapshot_file,
 };
-use serde_json::json;
 use tempfile::TempDir;
 
 fn persistence_cfg(dir: &Path, interval: Duration) -> PersistenceConfig {
@@ -31,7 +31,13 @@ fn list_ids(store: &MemoryStore, app: &str, collection: &str) -> Vec<String> {
         .list(
             app,
             collection,
-            ListParams { page: 1, limit: 1000, filters: vec![], ranges: Vec::new(), sort: None },
+            ListParams {
+                page: 1,
+                limit: 1000,
+                filters: vec![],
+                ranges: Vec::new(),
+                sort: None,
+            },
         )
         .items
         .iter()
@@ -45,7 +51,10 @@ fn newest_segment(dir: &Path) -> PathBuf {
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(raw) = name.strip_prefix("wal-").and_then(|n| n.strip_suffix(".log")) else {
+        let Some(raw) = name
+            .strip_prefix("wal-")
+            .and_then(|n| n.strip_suffix(".log"))
+        else {
             continue;
         };
         let epoch: u64 = raw.parse().unwrap();
@@ -103,7 +112,10 @@ fn persistence_roundtrip_preserves_state_and_order() {
 
     let restored = MemoryStore::new();
     let report = replay_data_dir(&restored, dir.path()).unwrap();
-    assert_eq!(report.wal_records, 6, "3 Upserts + Replace + Delete + Upsert");
+    assert_eq!(
+        report.wal_records, 6,
+        "3 Upserts + Replace + Delete + Upsert"
+    );
     assert!(report.stopped_early.is_none());
 
     // Replace schiebt `a` ans Ende, `b` ist weg, `d` kam zuletzt.
@@ -138,7 +150,10 @@ fn torn_tail_replays_the_prefix() {
 
     let restored = MemoryStore::new();
     let report = replay_data_dir(&restored, dir.path()).unwrap();
-    assert!(report.stopped_early.is_none(), "torn tail ist ein gueltiges Dateiende");
+    assert!(
+        report.stopped_early.is_none(),
+        "torn tail ist ein gueltiges Dateiende"
+    );
     assert_eq!(list_ids(&restored, "app", "tasks"), vec!["first", "second"]);
 }
 
@@ -163,8 +178,7 @@ fn crc_corruption_stops_the_file_but_keeps_the_prefix() {
     let mut offset = 6usize; // Header
     let mut last_payload: Option<std::ops::Range<usize>> = None;
     while offset + 8 <= bytes.len() {
-        let len =
-            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
         let start = offset + 8;
         if start + len > bytes.len() {
             break;
@@ -182,7 +196,10 @@ fn crc_corruption_stops_the_file_but_keeps_the_prefix() {
 
     let restored = MemoryStore::new();
     let report = replay_data_dir(&restored, dir.path()).unwrap();
-    assert!(report.stopped_early.is_some(), "CRC-Abweichung muss gemeldet werden");
+    assert!(
+        report.stopped_early.is_some(),
+        "CRC-Abweichung muss gemeldet werden"
+    );
     assert_eq!(report.wal_records, 1, "nur der Record vor der Korruption");
     assert!(restored.get("app", "tasks", "first").is_some());
     assert!(restored.get("app", "tasks", "second").is_none());
@@ -196,7 +213,10 @@ fn short_wal_files_are_skipped() {
 
     let restored = MemoryStore::new();
     let report = replay_data_dir(&restored, dir.path()).unwrap();
-    assert_eq!(report.wal_files, 0, "halb geschriebener Header = leere Datei");
+    assert_eq!(
+        report.wal_files, 0,
+        "halb geschriebener Header = leere Datei"
+    );
 }
 
 #[test]
@@ -344,7 +364,12 @@ fn tiering_eviction_and_cold_fetch_roundtrip() {
 
     // Mutationen auf Kaltstaenden greifen ueber das Tier.
     store
-        .replace("app", "tasks", "t1", json!({"n": 100, "status": "erledigt"}))
+        .replace(
+            "app",
+            "tasks",
+            "t1",
+            json!({"n": 100, "status": "erledigt"}),
+        )
         .expect("t1 existiert");
     assert!(store.delete("app", "tasks", "t2").is_some());
 
@@ -361,8 +386,14 @@ fn tiering_eviction_and_cold_fetch_roundtrip() {
     let store2 = Arc::new(MemoryStore::new());
     store2.set_hot_cap(4);
     let (report, tier) = replay_data_dir_full(&store2, dir.path()).unwrap();
-    assert_eq!(report.snapshot_docs, 9, "Shutdown-Snapshot haelt den Endzustand");
-    assert_eq!(report.wal_records, 2, "Replace t1 + Delete t2 aus dem Segment");
+    assert_eq!(
+        report.snapshot_docs, 9,
+        "Shutdown-Snapshot haelt den Endzustand"
+    );
+    assert_eq!(
+        report.wal_records, 2,
+        "Replace t1 + Delete t2 aus dem Segment"
+    );
     let cold2 = Arc::new(tier);
     store2.set_cold(Arc::clone(&cold2));
     let persistence2 = Persistence::start(
@@ -492,7 +523,10 @@ fn cold_tier_fetch_matches_replay_semantics() {
 
     assert_eq!(restored.get("app", "tasks", "t-up").unwrap()["v"], json!(2));
     assert!(restored.get("app", "tasks", "t-gone").is_none());
-    assert_eq!(restored.get("app", "tasks", "t-new").unwrap()["v"], json!(3));
+    assert_eq!(
+        restored.get("app", "tasks", "t-new").unwrap()["v"],
+        json!(3)
+    );
 
     // Und das Kalt-Tier entscheidet fuer dieselben Schluessel identisch:
     // das erste Tier mit Treffer gewinnt — ein Delete terminiert die Suche,

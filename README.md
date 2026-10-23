@@ -130,19 +130,46 @@ rate limiting and TLS belong).
 * **Hardened by audit** — see [SECURITY_AUDIT_V2.md](SECURITY_AUDIT_V2.md): constant-time
   API-key compare, create-if-absent POST (409), atomic PATCH, duplicate-header rejection,
   optional gateway provenance (`X-Internal-Auth`), 1 MiB body limit, auth before 404,
-  generic error messages. 108 tests.
+  generic error messages. Per-app CORS (preflight, origin allowlist, credential rules) and
+  gzip compression for large JSON responses. 138 tests.
 
 ## `apps.toml` reference
 
 | Field | Level | Meaning |
 |---|---|---|
 | `api_key_secret` | App | Secret for `X-API-Key` (required once any endpoint sets `auth_required = true`). Min. 16 chars; `${ENV_VAR}` indirection with fail-fast resolution |
+| `cors.allowed_origins` | App | Exact browser origins (case-insensitive) or exactly `["*"]`. **Without a `[cors]` section the engine sends no CORS headers** — browser frontends will see CORS errors |
+| `cors.allowed_methods` | App | Default: all supported methods (`GET, POST, PUT, PATCH, DELETE`) |
+| `cors.allowed_headers` | App | Default: `content-type`, `x-api-key`, `x-user-id`, `x-user-role` (exactly the headers the engine reads) |
+| `cors.exposed_headers` | App | Response headers browser JS may read via `Access-Control-Expose-Headers`. Default: `["location"]` (the 201 header) |
+| `cors.allow_credentials` | App | Default `false`; `true` requires explicit origins — `*` is rejected at startup (browsers refuse `*` alongside credentials) |
+| `cors.max_age_secs` | App | Optional preflight cache time, 1..=86400 |
 | `endpoints.<name>.path` | Endpoint | Collection path, exactly one segment (`/tasks`) |
 | `endpoints.<name>.method` | Endpoint | `GET`, `POST`, `PUT`, `PATCH` or `DELETE` |
 | `endpoints.<name>.auth_required` | Endpoint | Default `false`; `true` → 401 without valid `X-API-Key` |
 | `endpoints.<name>.paging_default` | Endpoint | Default page size for list GETs (1..=100, default 20) |
 | `endpoints.<name>.filter_fields` | Endpoint | Optional allowlist of filterable/sortable fields — security allowlist **and** index switch |
 | `endpoints.<name>.business_logic` | Endpoint | Rhai script with hook `fn on_request(payload, user)`; runs before storage on POST/PUT/PATCH; `throw` → 422 |
+
+CORS is enforced per app in middleware: preflights (`OPTIONS` + `Access-Control-Request-Method`)
+are answered with 204 (no auth, no storage touched) after checking origin, method and headers;
+actual requests from a disallowed origin are rejected with `403 cors_rejected` — so a browser
+call can never run its side effect only for the response to be blocked. Requests without an
+`Origin` header (curl, gateways, server-to-server) and `/health` are unaffected. Every actual
+response also carries `Access-Control-Expose-Headers` so browser code can read engine headers
+such as the 201 `Location`; preflights intentionally don't include it (Fetch spec).
+
+**Response compression is on by default**: JSON responses ≥ 1 KiB are gzipped when the client
+sends `Accept-Encoding: gzip` (or `*`), with `Vary: Accept-Encoding` for cache correctness.
+Clients without that header — curl scripts, gateways, server-to-server calls — receive the
+identical, uncompressed response. `--no-compression` disables the feature entirely.
+
+**Observability**: every request is logged as exactly one `info` line — method, path, status,
+elapsed µs and `request_id` — and every response carries that `X-Request-Id` header (a fresh
+UUID v4, or the gateway's own `X-Request-Id` when present, printable and ≤ 128 chars). Cite
+the ID from an error response and grep the log: it lands on the exact line. 4xx log at
+`debug`, 5xx at `warn`; expose `x-request-id` via `cors.exposed_headers` so browser code
+can read it.
 
 ### CRUD semantics
 

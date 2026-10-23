@@ -18,8 +18,8 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use steadfast_storage::{ColdTier, ColdKey, ListParams, MemoryStore, write_snapshot_file};
 use serde_json::json;
+use steadfast_storage::{ColdKey, ColdTier, ListParams, MemoryStore, write_snapshot_file};
 
 struct Config {
     docs: u64,
@@ -29,7 +29,10 @@ struct Config {
 
 fn config() -> Config {
     let env_num = |name: &str, default: u64| -> u64 {
-        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     };
     Config {
         docs: env_num("BENCH_DOCS", 200_000),
@@ -51,7 +54,7 @@ fn fmt_us(micros: u128) -> String {
     }
 }
 
-fn report(label: &str, latencies: &mut Vec<u128>, wall: Duration) {
+fn report(label: &str, latencies: &mut [u128], wall: Duration) {
     latencies.sort_unstable();
     let total = latencies.len();
     let per_sec = total as f64 / wall.as_secs_f64().max(f64::EPSILON);
@@ -107,7 +110,10 @@ fn main() {
         totals = Some(result.total);
     }
     let wall = start.elapsed();
-    println!("\n--- 2) Gefilterte Liste, Vollscan (status=offen, total {:?}) ---", totals);
+    println!(
+        "\n--- 2) Gefilterte Liste, Vollscan (status=offen, total {:?}) ---",
+        totals
+    );
     report("list scan", &mut latencies, wall);
 
     // 3) Gefilterte Liste ueber den Sekundaerindex -------------------------------
@@ -118,7 +124,11 @@ fn main() {
         let t0 = Instant::now();
         let result = black_box(store.list("bench", "tasks", params()));
         latencies.push(t0.elapsed().as_micros());
-        assert_eq!(result.total, totals.unwrap(), "Index muss denselben total liefern");
+        assert_eq!(
+            result.total,
+            totals.unwrap(),
+            "Index muss denselben total liefern"
+        );
     }
     let wall = start.elapsed();
     println!("\n--- 3) Gefilterte Liste, Sekundaerindex ---");
@@ -154,12 +164,16 @@ fn main() {
         let cold_id = format!("d{i}");
 
         let t0 = Instant::now();
-        let doc = store.get("bench", "tasks", &hot_id).expect("heisses Doc muss lesbar sein");
+        let doc = store
+            .get("bench", "tasks", &hot_id)
+            .expect("heisses Doc muss lesbar sein");
         hot_lat.push(t0.elapsed().as_micros());
         assert_eq!(doc["n"], json!(cfg.docs - 1 - i));
 
         let t0 = Instant::now();
-        let doc = store.get("bench", "tasks", &cold_id).expect("kaltes Doc muss aus dem Tier kommen");
+        let doc = store
+            .get("bench", "tasks", &cold_id)
+            .expect("kaltes Doc muss aus dem Tier kommen");
         cold_lat.push(t0.elapsed().as_micros());
         assert_eq!(doc["n"], json!(i));
     }
@@ -170,7 +184,11 @@ fn main() {
     let hot_wall = busy(&hot_lat);
     let cold_wall = busy(&cold_lat);
     report("get heiss", &mut hot_lat, hot_wall);
-    report("get kalt (Fetch-on-Miss + Promote)", &mut cold_lat, cold_wall);
+    report(
+        "get kalt (Fetch-on-Miss + Promote)",
+        &mut cold_lat,
+        cold_wall,
+    );
     let (_, cold_after) = store.hot_doc_counts("bench", "tasks").unwrap();
     println!(
         "  -> {}/2.000 kalt gelesen und promotiert (Restkalt: {cold_after})",
@@ -184,7 +202,11 @@ fn main() {
         let t0 = Instant::now();
         let result = black_box(store.list("bench", "tasks", params()));
         latencies.push(t0.elapsed().as_micros());
-        assert_eq!(result.total, totals.unwrap(), "Tiering darf total nicht veraendern");
+        assert_eq!(
+            result.total,
+            totals.unwrap(),
+            "Tiering darf total nicht veraendern"
+        );
         assert_eq!(result.items.len(), 100);
     }
     let wall = start.elapsed();
