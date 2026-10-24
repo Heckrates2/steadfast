@@ -4,13 +4,17 @@
 
 **Die Always-on-REST-Engine in Rust. Deine API ist eine TOML-Datei.**
 
+[![CI](https://github.com/Heckrates2/steadfast/actions/workflows/ci.yml/badge.svg)](https://github.com/Heckrates2/steadfast/actions/workflows/ci.yml)
+[![Lizenz: MIT oder Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#lizenz)
+
 Steadfast macht aus einer einzigen Konfigurationsdatei voll isolierte, gehärtete CRUD-REST-APIs —
 kein Endpunkt-Code, keine Migrationen, kein Boilerplate. Wenn PocketBase ein Geschwister hätte, das
 eine reine *Engine* wäre (kein Admin-UI, keine eingebaute Benutzerverwaltung — das gehört in dein
 Gateway), entworfen in-memory-first mit WAL-Persistenz und sandboxed Scripting — dann sähe es so aus.
 
 ```bash
-cargo run --release   # lauscht auf http://127.0.0.1:8080
+cargo install --git https://github.com/Heckrates2/steadfast --locked
+steadfast apps.toml 127.0.0.1:8080   # deine API läuft
 ```
 
 ## Benchmarks

@@ -4,13 +4,17 @@
 
 **The always-on REST engine in Rust. Your API is a TOML file.**
 
+[![CI](https://github.com/Heckrates2/steadfast/actions/workflows/ci.yml/badge.svg)](https://github.com/Heckrates2/steadfast/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
 Steadfast turns a single configuration file into fully isolated, hardened CRUD REST APIs —
 no endpoint code, no migrations, no boilerplate. If PocketBase had a sibling that is a pure
 *engine* (no admin UI, no built-in user management — that belongs to your gateway), designed
 in-memory-first with WAL persistence and sandboxed scripting, it would look like this.
 
 ```bash
-cargo run --release   # listening on http://127.0.0.1:8080
+cargo install --git https://github.com/Heckrates2/steadfast --locked
+steadfast apps.toml 127.0.0.1:8080   # your API is live
 ```
 
 ## Benchmarks
