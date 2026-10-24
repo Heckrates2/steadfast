@@ -3,6 +3,9 @@
 
 # Lokale Editor-/Agent-Sitzungsdaten
 .zcode/
+# Fehlgeleiteter Node-Compile-Cache (kaputtes TEMP ueber c/Temp), kommt
+# von lokalen Agent-Tools — nie Projektinhalt.
+/c/
 
 # Logs und Datenverzeichnisse gehoeren nie ins Repo (M5)
 *.log
