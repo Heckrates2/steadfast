@@ -1,5 +1,7 @@
 # Steadfast
 
+**English** · [Deutsch](README.de.md)
+
 **The always-on REST engine in Rust. Your API is a TOML file.**
 
 Steadfast turns a single configuration file into fully isolated, hardened CRUD REST APIs —
