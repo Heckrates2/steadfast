@@ -13,9 +13,56 @@ cargo run --release   # listening on http://127.0.0.1:8080
 
 ## Benchmarks
 
-Honest numbers, reproducible conditions: release build, load generator and server on the
-**same machine** (desktop Windows PC) — treat them as a *lower bound*; dedicated hardware
-does better. 32 keep-alive connections, 5,000 documents in RAM.
+Two views, published together on purpose: what a **real client on a real network** sees,
+and what the engine absorbs once the network is out of the picture. The unflattering run
+is in the table, not in a footnote.
+
+### Realistic: second machine, real LAN, real TCP/IP
+
+`wrk` 4.1 on Debian 13 (2 vCPU) drives the release build on a desktop Windows PC across
+the LAN (`perf.toml` app: no auth, no script, RAM-only store seeded with 5,000 documents —
+list pages ≈ 2.5 KB). 10 s per run, 100% 2xx responses. Unless noted, wrk reuses 32
+keep-alive connections — exactly what browsers, HTTP SDKs and reverse proxies do in
+production:
+
+| Scenario | RPS | avg latency | wire load |
+|---|---|---|---|
+| GET single document | **8,565** | 3.7 ms | 2.1 MB/s |
+| GET list, 20 docs/page (~2.5 KB) | **8,105** | 3.9 ms | 20.3 MB/s ≈ 160 Mbit/s |
+| GET list, gzipped | **7,910** | 4.0 ms | 6.3 MB/s |
+| POST — create | **8,346** | 3.8 ms | 2.8 MB/s |
+| PUT — full replace | **8,107** | 3.9 ms | 2.2 MB/s |
+| PATCH — partial update | **8,241** | 3.9 ms | 2.3 MB/s |
+| GET list — **a fresh TCP connection for every request** (64 conns) | **995** | 21.7 ms | 2.5 MB/s |
+
+Reading these honestly:
+
+* **The ~8.5k ceiling is the busy desktop host — not the engine, not the network.** All
+  variants converge regardless of payload size, doubling the connections to 64 changes
+  nothing (8,442 RPS), and the heaviest row moves ~160 Mbit/s of a 1,000 Mbit/s link. The
+  engine itself has far more headroom (loopback table below); on quiet, dedicated hardware
+  the next real ceiling is the uplink: ~45k RPS uncompressed, ~150k RPS gzipped at 2.5 KB
+  list pages on 1 GbE.
+* **The last row is the anti-benchmark, and it stays.** With `Connection: close`, every
+  request pays a full TCP handshake plus teardown — ~8.5× slower. That is the honest answer
+  to "what if every client connects fresh?", which is exactly why we won't quote keep-alive
+  numbers alone. Note what was never the problem: RAM. Memory scales with *concurrently
+  open* connections (a few MB at 32–64 sockets; even 50,000 open connections ≈ 0.5–2.5 GB),
+  not with requests per second.
+* **Reproduce it** (seed 5,000 docs with the bundled `loadtest` binary as documented in
+  `perf.toml`, then load-test from a second box):
+
+  ```bash
+  steadfast perf.toml 0.0.0.0:8081
+  wrk -t2 -c32 -d10s http://<server>:8081/perf_app/items
+  wrk -t2 -c64 -d10s -H 'Connection: close' http://<server>:8081/perf_app/items
+  ```
+
+### Engine headroom: generator and server on one machine (loopback)
+
+No NIC, no LAN latency, no cross-traffic — an upper bound on what a single process
+absorbs, not a deployment number. Release build, 32 keep-alive connections, 5,000
+documents in RAM:
 
 | HTTP scenario (see `perf.toml`, `loadtest`) | RPS | p50 | p99 |
 |---|---|---|---|
