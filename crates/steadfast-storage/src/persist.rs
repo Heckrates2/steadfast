@@ -251,9 +251,10 @@ fn worker_loop(
                         // Not-Aus im Rueckstau: Verbleibende Ops wenigstens
                         // in den Puffer ziehen (der Epilog flusht, sofern
                         // die Platte bis dahin wieder mitmacht).
+                        // dirty ist hier egal: Nach dem Break folgt der
+                        // Epilog, der per Snapshot ohnehin alles sichert.
                         while let Ok(op) = rx.try_recv() {
                             offset = write_record(&mut writer, &cold, offset, &op);
-                            dirty += 1;
                         }
                         break;
                     }
@@ -293,7 +294,6 @@ fn worker_loop(
             // auf die Platte, bevor der Abschluss-Snapshot entsteht.
             while let Ok(op) = rx.try_recv() {
                 offset = write_record(&mut writer, &cold, offset, &op);
-                dirty += 1;
             }
             break;
         }
