@@ -26,6 +26,22 @@ fn persistence_cfg(dir: &Path, interval: Duration) -> PersistenceConfig {
     }
 }
 
+/// Wartet, bis `cond` erstmals wahr ist (Poll alle 20 ms), und scheitert
+/// mit Assert nach `deadline`. Blinde sleeps waeren hier ein Wettrennen
+/// gegen den WAL-Worker — auf gedrosselten CI-Runnern mit langsamer Platte
+/// (fsync im Rotationspfad) verlieren sie das. Lokal greift meist der
+/// erste Poll, die Tests bleiben also schnell.
+fn wait_until(deadline: Duration, mut cond: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !cond() {
+        assert!(
+            start.elapsed() < deadline,
+            "Zustand nach {deadline:?} nicht erreicht — Worker haengt oder Platte zu langsam"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn list_ids(store: &MemoryStore, app: &str, collection: &str) -> Vec<String> {
     store
         .list(
@@ -231,11 +247,9 @@ fn worker_rotation_writes_snapshot_and_deletes_old_segments() {
     .unwrap();
 
     store.insert("app", "tasks", "a", json!({"n": 1}));
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(
-        dir.path().join("snapshot.bin").exists(),
-        "Rotation muss nach dem Tick einen Snapshot geschrieben haben"
-    );
+    wait_until(Duration::from_secs(15), || {
+        dir.path().join("snapshot.bin").exists()
+    });
     store.insert("app", "tasks", "b", json!({"n": 2}));
     persistence.shutdown(&store).unwrap();
 
@@ -342,15 +356,11 @@ fn tiering_eviction_and_cold_fetch_roundtrip() {
             json!({"n": i, "status": status}),
         );
     }
-    std::thread::sleep(Duration::from_millis(400));
-
     // Der Worker hat rotiert und evictiert: die 6 aeltesten Dokumente sind
     // kalt gestellt, Gesamtzahl und Liste bleiben aber vollstaendig.
-    assert_eq!(
-        store.hot_doc_counts("app", "tasks"),
-        Some((10, 6)),
-        "Worker-Rotation muss Eviction mit Kalt-Tier ausloesen"
-    );
+    wait_until(Duration::from_secs(15), || {
+        store.hot_doc_counts("app", "tasks") == Some((10, 6))
+    });
 
     // Direktzugriff auf das aelteste (kalte) Dokument, bevor irgendeine
     // Liste alles warmliest: Muss aus dem Tier nachladen und promoten.
@@ -408,9 +418,11 @@ fn tiering_eviction_and_cold_fetch_roundtrip() {
     store2
         .replace("app", "tasks", "t0", json!({"n": 0, "status": "offen"}))
         .expect("t0 existiert");
-    std::thread::sleep(Duration::from_millis(400));
-    let (_, cold_count) = store2.hot_doc_counts("app", "tasks").unwrap();
-    assert!(cold_count > 0, "erneute Rotation muss kalt stellen");
+    wait_until(Duration::from_secs(15), || {
+        store2
+            .hot_doc_counts("app", "tasks")
+            .is_some_and(|(_, cold)| cold > 0)
+    });
 
     // Jedes Dokument muss mit korrektem Payload lesbar sein — die kalten
     // kommen aus dem rekonstruierten Tier; das geloeschte Segment-File
@@ -573,7 +585,9 @@ fn size_trigger_rotates_mid_run_and_replay_stays_correct() {
     }
     // Dem Worker Zeit geben, die Ops zu schreiben und den Groessentrigger
     // zu bedienen (Rotation inkl. Snapshot und Loeschung alter Segmente).
-    std::thread::sleep(Duration::from_millis(500));
+    wait_until(Duration::from_secs(15), || {
+        dir.path().join("snapshot.bin").exists() && segment_count(dir.path()) == 1
+    });
 
     let snapshot = dir.path().join("snapshot.bin");
     assert!(
