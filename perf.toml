@@ -25,3 +25,11 @@
   [apps.perf_app.endpoints.items_post]
   path = "/items"
   method = "POST"
+
+  [apps.perf_app.endpoints.items_put]
+  path = "/items"
+  method = "PUT"
+
+  [apps.perf_app.endpoints.items_patch]
+  path = "/items"
+  method = "PATCH"
