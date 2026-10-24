@@ -770,13 +770,16 @@ impl MemoryStore {
         collection: &str,
         id: &str,
     ) -> Option<Arc<Value>> {
-        if let Some(slot) = inner.by_id.get(id) {
+        // Heisser Pfad: Der Lese-Guard des DashMap-Shards lebt bewusst nur
+        // in diesem Block — weiter unten nimmt get_mut(id) dieselbe Shard-
+        // Sperre schreibend; ein laenger lebender Guard blockiert sich selbst.
+        let hot = {
+            let slot = inner.by_id.get(id)?;
             slot.access.store(self.tick(), Ordering::Relaxed);
-            if let Some(doc) = slot.data.as_ref() {
-                return Some(Arc::clone(doc));
-            }
-        } else {
-            return None;
+            slot.data.as_ref().map(Arc::clone)
+        };
+        if let Some(doc) = hot {
+            return Some(doc);
         }
         let tier = Arc::clone(self.cold.read().expect("cold slot poisoned").as_ref()?);
         let doc = match tier.fetch(app, collection, id) {
