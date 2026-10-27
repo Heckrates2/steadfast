@@ -9,8 +9,9 @@
 
 Steadfast turns a single configuration file into fully isolated, hardened CRUD REST APIs —
 no endpoint code, no migrations, no boilerplate. If PocketBase had a sibling that is a pure
-*engine* (no admin UI, no built-in user management — that belongs to your gateway), designed
-in-memory-first with WAL persistence and sandboxed scripting, it would look like this.
+*engine* (config-driven, with **optional built-in per-app user auth** — JWT logins, refresh
+rotation, roles — and a gateway-trust mode for machine access), designed in-memory-first with
+WAL persistence and sandboxed scripting, it would look like this.
 
 ```bash
 cargo install --git https://github.com/Heckrates2/steadfast --locked
@@ -89,13 +90,33 @@ Store-level microbenchmarks (`bench_tiering`, 200k docs, hot cap 50k):
 | Cold GET (fetch from WAL/snapshot on disk) | p50 102 µs, p99 158 µs |
 | Indexed equality list vs. linear scan | 21 ms vs. 66 ms (3.2×) |
 
+### Auth overhead: the same list, once public, once `auth_mode = "jwt"`
+
+`perf-auth.toml` (two identical 5,000-doc collections, one public, one JWT-gated; release
+build, loopback, 32 keep-alive connections — reproduce as documented in the file):
+
+| Scenario | RPS | p50 | p99 |
+|---|---|---|---|
+| GET list, no auth | **44,121–45,097** | 0.67 ms | 1.6 ms |
+| GET list, JWT (`Authorization: Bearer`) | **40,455–40,634** | 0.74 ms | 1.8 ms |
+| Indexed equality filter, no auth | 40,850 | 0.73 ms | 1.9 ms |
+| Indexed equality filter + JWT | 43,323 | 0.69 ms | 1.7 ms |
+| POST (RAM-only) + JWT | 40,741 | 0.74 ms | 1.8 ms |
+| Single login (Argon2id verify + token issue) | — | ~28 ms | — |
+
+Reading these honestly: JWT verification plus the fresh per-request user lookup costs
+roughly **8–10 % throughput / ~60–80 µs p50** on list reads. Run-to-run noise on this host
+is ±5 % (the filter pair even flipped — the "faster" JWT run is the busy desktop, not the
+token). Logins are Argon2-bound (~28 ms each) and rate-limited by design; they are a
+correctness path, not a throughput path.
+
 Crash-tested: kill -9 mid-write, restart replays snapshot + WAL segments and restores every
 document, including tiered-out ones (fetch-on-miss), with CRC32-checked segments and torn-tail
 tolerance.
 
 ## Quickstart — the whole idea in two boxes
 
-Your entire API (including business logic) is configuration:
+Your entire API (including business logic and user auth) is configuration:
 
 <table>
 <tr>
@@ -106,24 +127,29 @@ Your entire API (including business logic) is configuration:
 <td>
 
 ```toml
-[apps.todo_app]
-api_key_secret = "${TODO_APP_SECRET}"
+[apps.muster_app]
 
-  [apps.todo_app.endpoints.tasks_get]
-  path = "/tasks"
-  method = "GET"
+  # Per-app user auth: /muster_app/_auth/* (login,
+  # refresh, logout, register, admin user management)
+  [apps.muster_app.auth]
+  enabled = true
+  jwt_secret = "${MUSTER_JWT_SECRET}"   # min 32 chars
+  admin_email = "admin@example.com"
+  admin_password = "${MUSTER_ADMIN_PASSWORD}"
 
-  [apps.todo_app.endpoints.tasks_create]
-  path = "/tasks"
+  [apps.muster_app.endpoints.notes_get]
+  path = "/notes"
+  method = "GET"          # public read
+
+  [apps.muster_app.endpoints.notes_create]
+  path = "/notes"
   method = "POST"
-  auth_required = true
+  auth_mode = "jwt"       # users log in, scripts see
+  roles = ["user", "admin"]  # user.id / user.role claims
 
   # Sandboxed business logic (20k ops / 5 ms deadline):
   business_logic = """
   fn on_request(payload, user) {
-      if user.role != "premium" && payload.is_priority == true {
-          throw "Only premium users may create priority tasks!";
-      }
       payload.created_by = user.id;
       payload.status = "open";
       return payload;
@@ -135,45 +161,53 @@ api_key_secret = "${TODO_APP_SECRET}"
 <td>
 
 ```bash
-# Create (script runs, sets created_by/status)
-curl -X POST localhost:8080/todo_app/tasks \
-  -H "x-api-key: $TODO_APP_SECRET" \
-  -H "x-user-id: user_1" \
-  -H "x-user-role: premium" \
+# Login → access token (15 min) + rotating refresh token
+curl -X POST localhost:8080/muster_app/_auth/login \
   -H "content-type: application/json" \
-  -d '{"title": "First task", "is_priority": true}'
+  -d '{"email": "admin@example.com",
+       "password": "…"}'
+# → {"access_token": "eyJ…", "refresh_token": "…", …}
 
+# Create (script runs, sets created_by from JWT claims)
+curl -X POST localhost:8080/muster_app/notes \
+  -H "authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"title": "First note"}'
 # → 201 Created + Location header
 
 # List (open, paged, filterable, sortable)
-curl 'localhost:8080/todo_app/tasks?status=open&limit=10'
+curl 'localhost:8080/muster_app/notes?status=open&limit=10'
 
-# Item CRUD
-curl localhost:8080/todo_app/tasks/<id>
-curl -X PATCH localhost:8080/todo_app/tasks/<id> \
-  -H "x-api-key: $TODO_APP_SECRET" \
-  -H "content-type: application/json" \
-  -d '{"status": "done"}'
-curl -X DELETE localhost:8080/todo_app/tasks/<id> \
-  -H "x-api-key: $TODO_APP_SECRET"
+# Rotate the refresh token (old one becomes single-use
+# evidence; replay revokes ALL of the user's tokens)
+curl -X POST localhost:8080/muster_app/_auth/refresh \
+  -d '{"refresh_token": "…"}'
+
+# Machine endpoints keep the classic API key in parallel:
+curl -X POST localhost:8080/muster_app/imports \
+  -H "x-api-key: $MUSTER_APP_SECRET" \
+  -d '{"row": 1}'
 ```
 
 </td>
 </tr>
 </table>
 
-Add `--data-dir data` and the engine becomes persistent (WAL + snapshots, survives crashes
-and restarts). Every `[apps.<id>]` section is a fully isolated tenant.
+Apps without an `[auth]` section stay exactly on the API-key/gateway model — the auth module
+costs them nothing. Add `--data-dir data` and the engine becomes persistent (WAL + snapshots,
+survives crashes and restarts). Every `[apps.<id>]` section is a fully isolated tenant,
+including its user directory.
 
 ## Why
 
 Small and mid-sized backends rarely need a microservice zoo — they need one fast, honest
 process that holds data safely and never falls over. Steadfast is the counter-proposal to
 "just spin up 5 containers": a single binary, one config file, in-memory speed with
-disk-backed durability, and a trust boundary that assumes a gateway in front (where auth,
-rate limiting and TLS belong).
+disk-backed durability — and auth you choose per app: built-in user management (JWT, roles,
+lockout, rate-limited logins) or a lean gateway-trust boundary for machine traffic (where
+TLS and edge rate limiting belong).
 
-* **Config-driven endpoints** — routes, auth flags, paging, filter allowlists and sandboxed
+* **Config-driven endpoints** — routes, auth modes, paging, filter allowlists and sandboxed
   [Rhai](https://rhai.rs) hooks are declared, precompiled and validated at startup (fail-fast).
 * **Declarative schema validation** — an optional per-endpoint `[schema]` section on
   mutations (`required`, field `types` — including `"date"` and RFC 3339 `"datetime"` —,
@@ -190,22 +224,32 @@ rate limiting and TLS belong).
   API-key compare, create-if-absent POST (409), atomic PATCH, duplicate-header rejection,
   optional gateway provenance (`X-Internal-Auth`), 1 MiB body limit, auth before 404,
   generic error messages. Per-app CORS (preflight, origin allowlist, credential rules) and
-  gzip compression for large JSON responses. 164 tests.
+  gzip compression for large JSON responses. Optional per-app user auth (Argon2id, JWT,
+  rotating refresh tokens, lockout, rate-limited logins). 228 tests.
 
 ## `apps.toml` reference
 
 | Field | Level | Meaning |
 |---|---|---|
-| `api_key_secret` | App | Secret for `X-API-Key` (required once any endpoint sets `auth_required = true`). Min. 16 chars; `${ENV_VAR}` indirection with fail-fast resolution |
+| `api_key_secret` | App | Secret for `X-API-Key` (required once any endpoint sets `auth_mode = "api_key"` / `auth_required = true`). Min. 16 chars; `${ENV_VAR}` indirection with fail-fast resolution |
+| `auth.enabled` | App | `true` activates the per-app user auth (`/{app}/_auth/*` endpoints, `auth_mode = "jwt"` on endpoints). Without an `[auth]` section the app stays on the API-key/gateway model — zero overhead |
+| `auth.jwt_secret` | App | HS256 signing secret for access tokens, min. 32 chars, `${ENV_VAR}` indirection (required when `enabled = true`) |
+| `auth.access_token_secs` / `auth.refresh_token_secs` | App | Token lifetimes (defaults 15 min / 30 days; refresh tokens rotate on every use) |
+| `auth.registration_open` | App | Default `false` — then only admins create users via `POST /_auth/users` |
+| `auth.allowed_origins` | App | Exact origins allowed to use the cookie mode (CSRF origin check, no `*`); fallback: concrete `cors.allowed_origins`. Absent = Bearer-only |
+| `auth.admin_email` + `auth.admin_password` | App | Bootstrap admin, created at startup if the email is missing (password must satisfy the policy) |
+| `auth.password_policy.*` | App | Fully configurable password rules: `min_length` (default 10), `max_length` (default 128, hard cap 1024), `require_lowercase`, `require_uppercase`, `require_digits`, `require_special` (default all `true`) |
+| `auth.rate_limit.*` | App | Token bucket per client IP on the auth endpoints: `login_per_min` (10), `register_per_min` (5), `refresh_per_min` (30) |
 | `cors.allowed_origins` | App | Exact browser origins (case-insensitive) or exactly `["*"]`. **Without a `[cors]` section the engine sends no CORS headers** — browser frontends will see CORS errors |
 | `cors.allowed_methods` | App | Default: all supported methods (`GET, POST, PUT, PATCH, DELETE`) |
-| `cors.allowed_headers` | App | Default: `content-type`, `x-api-key`, `x-user-id`, `x-user-role` (exactly the headers the engine reads) |
+| `cors.allowed_headers` | App | Default: `authorization`, `content-type`, `x-api-key`, `x-user-id`, `x-user-role` (exactly the headers the engine reads) |
 | `cors.exposed_headers` | App | Response headers browser JS may read via `Access-Control-Expose-Headers`. Default: `["location"]` (the 201 header) |
 | `cors.allow_credentials` | App | Default `false`; `true` requires explicit origins — `*` is rejected at startup (browsers refuse `*` alongside credentials) |
 | `cors.max_age_secs` | App | Optional preflight cache time, 1..=86400 |
 | `endpoints.<name>.path` | Endpoint | Collection path, exactly one segment (`/tasks`) |
 | `endpoints.<name>.method` | Endpoint | `GET`, `POST`, `PUT`, `PATCH` or `DELETE` |
-| `endpoints.<name>.auth_required` | Endpoint | Default `false`; `true` → 401 without valid `X-API-Key` |
+| `endpoints.<name>.auth_mode` | Endpoint | `"api_key"` (classic `X-API-Key`; `auth_required = true` remains the shorthand) or `"jwt"` (requires enabled `[auth]`; verifies `Authorization: Bearer` and reads `user.id`/`user.role` fresh from the user document). No `auth_mode` = public endpoint |
+| `endpoints.<name>.roles` | Endpoint | Optional role allowlist (only with `auth_mode = "jwt"`): the user's *current* role must match, else 403. Absent = every authenticated user of the app |
 | `endpoints.<name>.paging_default` | Endpoint | Default page size for list GETs (1..=100, default 20) |
 | `endpoints.<name>.filter_fields` | Endpoint | Optional allowlist of filterable/sortable fields — security allowlist **and** index switch |
 | `endpoints.<name>.business_logic` | Endpoint | Rhai script with hook `fn on_request(payload, user)`; runs before storage on POST/PUT/PATCH; `throw` → 422 |
@@ -260,6 +304,30 @@ User metadata for scripts comes from `X-User-Id` / `X-User-Role` (defaults `anon
 `user`). Set `ENGINE_GATEWAY_SECRET` and these headers only count when the request proves
 gateway provenance via `X-Internal-Auth` — direct clients cannot spoof roles.
 
+### Per-app user auth (`[auth]`, `/_auth/*`)
+
+With `auth.enabled = true` an app gets its own user directory and endpoints under
+`/{app_id}/_auth/`:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /_auth/login` | `{email, password, use_cookie?}` → access token (JWT, HS256, `iss = steadfast:<app>`) + refresh token (body, or `HttpOnly`+`Secure`+`SameSite=Strict` cookie scoped to `/{app}/_auth` in cookie mode). Uniform 401 `invalid_credentials` for unknown email / wrong password / locked / disabled accounts — with an Argon2 dummy run for timing parity |
+| `POST /_auth/refresh` | Single-use rotation (atomic under the collection write lock). Replaying a rotated token revokes **all** of the user's refresh tokens (theft alarm) and returns 401. Cookie-based refresh requires an allowed `Origin` (CSRF) |
+| `POST /_auth/logout` | Revokes the presented refresh token, clears the cookie (idempotent) |
+| `POST /_auth/register` | Self-registration, only when `registration_open = true`; policy violations return 400 with the violated rules |
+| `GET /_auth/me` | Own profile from verified claims (re-checked against the store) |
+| `GET/POST /_auth/users`, `PATCH /_auth/users/{id}` | Admin user management (role changes and deactivation take effect immediately, deactivation also revokes all refresh tokens) |
+
+Security properties: **Argon2id** password hashing (per-user salt, OWASP parameters),
+**configurable password policy** (length + character classes, every rule a TOML switch),
+**account lockout** (10 failed logins → exponential lock 15 min → 24 h cap), **rate limiting**
+per client IP (token bucket, 429 + `Retry-After`), **tenant isolation** (users, tokens and
+secrets never cross apps — separate JWT secrets *and* issuer claims), security headers
+(`Cache-Control: no-store`, `X-Content-Type-Options`, `Referrer-Policy`) and audit log lines
+for logins, lockouts and rotation alarms. Users and refresh-token hashes (SHA-256, never the
+token itself) live as ordinary documents in the app's WAL-persisted store; a background
+sweeper removes expired tokens after a 7-day evidence window.
+
 ## Persistence & tiering in 60 seconds
 
 * `--data-dir <dir>` enables WAL + snapshots; `--snapshot-interval` (default 60 s) and
@@ -274,17 +342,23 @@ gateway provenance via `X-Internal-Auth` — direct clients cannot spoof roles.
 
 ## Security model
 
-Steadfast is an **engine behind your gateway**. It owns app secrets, storage, sandboxing
-and durability; your gateway owns users, sessions, rate limits and TLS. The contract:
+Steadfast supports two trust models, chosen **per app** in `apps.toml`:
 
-1. The gateway MUST strip and re-set `X-API-Key`, `X-User-*`, `X-Internal-Auth`
-   (replace, never append — duplicate headers are rejected with 400).
-2. Restrict network access to the gateway; optionally set `ENGINE_GATEWAY_SECRET` to
-   enforce header provenance in code.
-3. Startup warnings cover the classic footguns: write endpoints without `auth_required`,
-   non-loopback binds, unlimited `--max-docs`.
+1. **Built-in per-app user auth** (`[auth]` with `enabled = true`): the engine owns users,
+   Argon2id password hashing, JWT access tokens, rotating refresh tokens, roles, lockout and
+   rate limiting for the auth endpoints (see above). Endpoints opt in via
+   `auth_mode = "jwt"`, optionally restricted by `roles`. Machine endpoints keep
+   `auth_mode = "api_key"` in parallel.
+2. **Gateway-trust mode** (no `[auth]` section): the classic contract — the engine owns app
+   secrets, storage, sandboxing and durability; your gateway owns users, sessions and TLS.
+   The gateway MUST strip and re-set `X-API-Key`, `X-User-*`, `X-Internal-Auth` (replace,
+   never append — duplicate headers are rejected with 400); optionally set
+   `ENGINE_GATEWAY_SECRET` to enforce header provenance in code, and restrict network access
+   to the gateway. Startup warnings cover the classic footguns: write endpoints without any
+   auth, non-loopback binds, unlimited `--max-docs`.
 
-Known, documented limits: no audit trail yet (Phase 3), rate limiting belongs to the gateway.
+Known, documented limits: no audit trail beyond structured log lines (Phase 3), rate limiting
+for the *data* endpoints still belongs to the gateway (the `/_auth` endpoints carry their own).
 The full verification trail of every finding and fix lives in
 [SECURITY_AUDIT_V2.md](SECURITY_AUDIT_V2.md); vulnerability reports: [SECURITY.md](SECURITY.md).
 
@@ -292,9 +366,10 @@ The full verification trail of every finding and fix lives in
 
 | Crate | Purpose |
 |---|---|
-| `steadfast-core` | `apps.toml` parsing/validation, Rhai AST precompile + sandbox (HTTP-free) |
+| `steadfast-core` | `apps.toml` parsing/validation (incl. `[auth]`, `password_policy`), Rhai AST precompile + sandbox (HTTP-free) |
 | `steadfast-storage` | In-memory store (DashMap, dual index, `Arc<Value>`), WAL/snapshot persistence, tiering, secondary indexes |
-| `steadfast-server` | Axum hot path, auth, binary `steadfast` (plus `loadtest` load generator) |
+| `steadfast-auth` | Per-app user auth: Argon2id, JWT + refresh rotation with reuse detection, lockout, rate limiting, `/_auth` endpoints |
+| `steadfast-server` | Axum hot path, auth dispatch, binary `steadfast` (plus `loadtest` load generator) |
 
 Planned Phase 3: distributed mode (gRPC contracts, Redis/Dragonfly shared memory layer,
 rate limiting, audit trail, HMAC-secured segments).

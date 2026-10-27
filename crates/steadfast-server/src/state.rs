@@ -5,7 +5,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use steadfast_core::{CorsConfig, EndpointRuntime, EngineConfig, EngineError, HttpMethod};
+use steadfast_auth::AppAuth;
+use steadfast_core::{
+    AuthMode, CorsConfig, EndpointRuntime, EngineConfig, EngineError, HttpMethod,
+};
 use steadfast_storage::MemoryStore;
 
 /// Alle Endpunkte eines konfigurierten Pfades einer App, nach HTTP-Methode.
@@ -66,6 +69,11 @@ struct Inner {
     /// der Betreiber, werden `X-User-*`-Header nur noch honoring, wenn der
     /// Request per `X-Internal-Auth` seine Herkunft vom Gateway belegt.
     gateway_secret: Option<Arc<str>>,
+    /// Aktive App-Auths (`[apps.<id>.auth]` mit `enabled = true`): App-ID ->
+    /// Runtime-State (JWT-Keys, User-Store, Rate-Limiter). Apps ohne
+    /// `[auth]`-Sektion tauchen hier nicht auf — ihr Hot Path bleibt
+    /// unangetastet.
+    auth: HashMap<String, Arc<AppAuth>>,
     /// gzip-Komprimierung von JSON-Antworten (default an, `--no-compression`
     /// schaltet ab). AtomicBool, damit `main` den Schalter nach dem Build
     /// umlegen kann, ohne den Konstruktor-Signatur aller Tests zu aendern.
@@ -100,6 +108,7 @@ impl AppState {
         }
 
         let mut apps: HashMap<String, AppRoutes> = HashMap::new();
+        let mut auth: HashMap<String, Arc<AppAuth>> = HashMap::new();
         for (app_id, app) in config.apps {
             let mut paths: HashMap<String, PathRoutes> = HashMap::new();
             // Union der filter_fields aller GET-Endpunkte je Pfad: Genau diese
@@ -110,10 +119,10 @@ impl AppState {
                 BTreeMap::new();
             let mut unauthenticated_writes: Vec<String> = Vec::new();
             for endpoint in app.endpoints.into_values() {
-                // M6: Ein schreibender Endpoint ohne auth_required ist die
-                // haeufigste Fehlkonfiguration (Default ist false) — beim
+                // M6: Ein schreibender Endpoint ganz ohne Auth ist die
+                // haeufigste Fehlkonfiguration (Default ist none) — beim
                 // Start laut sichtbar machen, statt sie still zu erlauben.
-                if endpoint.method != HttpMethod::Get && !endpoint.auth_required {
+                if endpoint.method != HttpMethod::Get && endpoint.auth_mode == AuthMode::None {
                     unauthenticated_writes.push(format!(
                         "{} {}",
                         endpoint.method.as_str(),
@@ -144,9 +153,25 @@ impl AppState {
             if !unauthenticated_writes.is_empty() {
                 tracing::warn!(
                     app = %app_id,
-                    endpoints = %unauthenticated_writes.join(", "),
-                    "write endpoints without auth_required = true — jeder Client darf hier unauthentifiziert schreiben"
+                    endpoints = unauthenticated_writes.join(", "),
+                    "write endpoints without auth (neither api_key nor jwt) — jeder Client darf hier unauthentifiziert schreiben"
                 );
+            }
+            // App-Auth initialisieren (Indizes, Bootstrap-Admin, Dummy-Hash)
+            // — passiert im selben Store wie der Hot Path, damit Logins und
+            // WAL-Persistenz dieselben Dokumente sehen.
+            if let Some(settings) = app.auth {
+                let app_auth = AppAuth::init(
+                    &app_id,
+                    (*settings).clone(),
+                    Arc::clone(&store),
+                    app.cors.as_deref(),
+                )?;
+                tracing::info!(
+                    app = %app_id,
+                    "App-Auth aktiv: /{app_id}/_auth/* (JWT-Login, Refresh-Rotation, Rate-Limit)"
+                );
+                auth.insert(app_id.clone(), Arc::new(app_auth));
             }
             apps.insert(
                 app_id,
@@ -163,6 +188,7 @@ impl AppState {
                 apps,
                 store,
                 gateway_secret: gateway_secret.map(Into::into),
+                auth,
                 compression_enabled: AtomicBool::new(true),
             }),
         })
@@ -174,6 +200,16 @@ impl AppState {
 
     pub fn store(&self) -> &MemoryStore {
         &self.inner.store
+    }
+
+    /// Aktive App-Auth dieser App (None = keine `[auth]`-Sektion aktiv).
+    pub fn app_auth(&self, app_id: &str) -> Option<&Arc<AppAuth>> {
+        self.inner.auth.get(app_id)
+    }
+
+    /// Alle aktiven App-Auths (fuer den Sweeper-Task in `main`).
+    pub fn auth_handles(&self) -> Vec<Arc<AppAuth>> {
+        self.inner.auth.values().cloned().collect()
     }
 
     /// Konfiguriertes Gateway-Secret (H1'); `None` = Provenienzpruefung

@@ -1,0 +1,34 @@
+[package]
+name = "steadfast-auth"
+description = "Per-App-Authentifizierung der REST-Engine (JWT, Refresh-Rotation, Passwoerter)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+steadfast-core = { workspace = true }
+steadfast-storage = { workspace = true }
+argon2 = { workspace = true }
+base64 = { workspace = true }
+dashmap = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dependencies.axum]
+workspace = true
+default-features = false
+features = ["http1", "json", "tokio"]
+
+[dev-dependencies]
+tower = { workspace = true }

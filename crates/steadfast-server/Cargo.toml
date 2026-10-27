@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 steadfast-core = { workspace = true }
 steadfast-storage = { workspace = true }
+steadfast-auth = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

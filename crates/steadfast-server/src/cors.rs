@@ -236,7 +236,7 @@ api_key_secret = "web_secret_123_geheim"
         // Allowlist-Echo lowercase + sortiert.
         assert_eq!(
             h.get(header::ACCESS_CONTROL_ALLOW_HEADERS).unwrap(),
-            "content-type, x-api-key, x-user-id, x-user-role"
+            "authorization, content-type, x-api-key, x-user-id, x-user-role"
         );
         assert_eq!(h.get(header::ACCESS_CONTROL_MAX_AGE).unwrap(), "600");
         assert_eq!(h.get(header::VARY).unwrap(), "Origin");

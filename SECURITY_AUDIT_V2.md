@@ -7,6 +7,8 @@
 
 **Anmerkung zur Historie:** Der ursprüngliche V2-Report meldete vier bereits behobene Findings als offen (M1, M4, N4, N6). V2.1 korrigierte das, enthielt aber selbst einen veralteten Befund: Die M6-Start-WARNING für schreibende Endpunkte existierte zum Zeitpunkt des Reports bereits im Code (`state.rs`) — der README-Claim stimmte also, der Audit nicht. V2.2 verifiziert sämtliche Fixes inklusive Testabdeckung.
 
+**Update 2026-10-27 (per-App-Auth, `steadfast-auth`):** Die Zuständigkeitsmatrix in Abschnitt 1 gilt weiterhin für Apps **ohne** `[auth]`-Sektion (Gateway-Modell, unverändert). Neu: Apps koennen per `[apps.<id>.auth]` eine eingebaute Benutzer-Auth aktivieren (Argon2id-Passwoerter, JWT-Access-Tokens mit App-Issuer, rotierende Refresh-Tokens mit Wiederverwendungs-Cascade, Lockout, Rollen frisch aus dem Store, Rate-Limiting der `/_auth`-Endpunkte je Client-IP — M2 damit fuer die Auth-Endpunkte erfuellt, Daten-Endpunkte bleiben Gateway-Scope). Tenant-Isolation: Benutzer/Tokens/Secrets kreuzen Apps nie. Alle Findings dieser Tabelle bleiben unberuehrt; N7 (Audit-Trail) bleibt Phase 3 (Login-/Lockout-/Rotations-Events gehen als strukturierte Logzeilen). Testabdeckung des Moduls: `crates/steadfast-auth` (38 Tests) plus 6 Handler-Integrationstests.
+
 ---
 
 ## 1. Scope und Architektur-Annahme (V2)

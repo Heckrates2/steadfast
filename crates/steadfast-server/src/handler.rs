@@ -4,12 +4,14 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use steadfast_core::{EndpointRuntime, EngineError, HttpMethod, MAX_PAGE_SIZE, ScriptRuntime};
+use steadfast_core::{
+    AuthMode, EndpointRuntime, EngineError, HttpMethod, MAX_PAGE_SIZE, ScriptRuntime,
+};
 use steadfast_storage::{ListParams, ListResult, PatchOutcome, RangeOp, SortSpec};
 use uuid::Uuid;
 
@@ -44,8 +46,37 @@ const RANGE_SUFFIXES: [(&str, RangeOp); 4] = [
     ("_lt", RangeOp::Lt),
 ];
 
+/// Infallibler Extractor fuer die Client-IP (Rate-Limiting der App-Auth):
+/// liest nur die `ConnectInfo`-Extension, die `main` via
+/// `into_make_service_with_connect_info` beifuegt — fehlt sie (Tests ohne
+/// Socket, eingebettete Routers), ist die Adresse schlicht `None` und der
+/// Rate-Limiter teilt sich den Ersatzschluessel "unknown". Ein natives
+/// `Option<ConnectInfo>` scheitert: axum 0.8 verlangt dafuer
+/// `OptionalFromRequestParts`, das ConnectInfo nicht implementiert.
+pub(crate) struct ClientIp(Option<std::net::IpAddr>);
+
+impl<S> axum::extract::FromRequestParts<S> for ClientIp
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(ClientIp(
+            parts
+                .extensions
+                .get::<ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0.ip()),
+        ))
+    }
+}
+
 pub async fn handle(
     State(state): State<AppState>,
+    client_ip: ClientIp,
     method: Method,
     Path((app_id, rest)): Path<(String, String)>,
     headers: HeaderMap,
@@ -65,8 +96,39 @@ pub async fn handle(
         );
     }
 
-    // --- Pfad auftrennen: /{app_id}/{collection}[/{item_id}] -------------
     let rest = rest.trim_end_matches('/');
+    // N5: HEAD laeuft durch den GET-Pfad; der Body wird am Ende entfernt.
+    let is_head = method.as_str() == "HEAD";
+
+    let Some(app_routes) = state.app(&app_id) else {
+        return not_found();
+    };
+
+    // --- App-Auth: /{app_id}/_auth/* Subrouter ------------------------------
+    // Vor dem Config-Lookup: aktivierte App-Auths betreiben ihre Endpunkte
+    // unterhalb des reservierten `/_auth`-Segments (Login/Refresh/...).
+    // Die Pfadaufteilung dorthin ist tiefer (users/{id}) als die
+    // Kollektions-/Item-Logik unten — deshalb hier gesondert.
+    if let Some(app_auth) = state.app_auth(&app_id) {
+        if let Some(sub_path) = auth_sub_path(rest) {
+            let response = steadfast_auth::route(
+                app_auth,
+                sub_path,
+                &method,
+                &headers,
+                &raw_query,
+                body,
+                client_ip.0,
+            );
+            return if is_head {
+                strip_body(response).await
+            } else {
+                response
+            };
+        }
+    }
+
+    // --- Pfad auftrennen: /{app_id}/{collection}[/{item_id}] -------------
     let (config_path, item_id) = match rest.split_once('/') {
         Some((collection, id)) => {
             if collection.is_empty()
@@ -82,17 +144,12 @@ pub async fn handle(
     };
 
     // --- Config-Lookup im RAM (O(1)) --------------------------------------
-    let Some(app_routes) = state.app(&app_id) else {
-        return not_found();
-    };
     let Some(path_routes) = app_routes.path(&config_path) else {
         // N1: Fuer Apps mit Secret wird unbekannten Pfaden keine Struktur
         // verraten — ohne gueltigen Key gibt es 401 statt 404, erst
         // authentifizierte Clients unterscheiden 404/405 von 401.
-        return hidden_behind_auth(app_routes, &headers, not_found);
+        return hidden_behind_auth(app_routes, state.app_auth(&app_id), &headers, not_found);
     };
-    // HEAD laeuft durch den GET-Pfad; der Body wird am Ende entfernt.
-    let is_head = method.as_str() == "HEAD";
     let core_method = match method.as_str() {
         "GET" | "HEAD" => HttpMethod::Get,
         "POST" => HttpMethod::Post,
@@ -101,44 +158,89 @@ pub async fn handle(
         "DELETE" => HttpMethod::Delete,
         // Andere Methoden sind im MVP nicht konfigurierbar (N1: auch hier
         // kein Struktur-Oracle fuer unauthentifizierte Requests).
-        _ => return hidden_behind_auth(app_routes, &headers, || method_not_allowed(path_routes)),
+        _ => {
+            return hidden_behind_auth(app_routes, state.app_auth(&app_id), &headers, || {
+                method_not_allowed(path_routes)
+            });
+        }
     };
     let Some(endpoint) = path_routes.method(core_method) else {
-        return hidden_behind_auth(app_routes, &headers, || method_not_allowed(path_routes));
+        return hidden_behind_auth(app_routes, state.app_auth(&app_id), &headers, || {
+            method_not_allowed(path_routes)
+        });
     };
 
     // --- Auth (sofortiger Abbruch bei Fehlschlag) -------------------------
-    if endpoint.auth_required {
-        let Some(secret) = app_routes.secret() else {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "config_error",
-                "endpoint requires auth but the app has no api_key_secret",
-            );
-        };
-        let provided = headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok());
-        if !verify_api_key(provided, secret) {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing or invalid API key",
-            );
+    // `jwt_user`: frisch verifizierter Benutzer (Rolle aus dem Store) —
+    // seine Claims gewinnen spaeter ueber den X-User-*-Headern, damit kein
+    // Client per Header eine Rolle schmieden kann.
+    let mut jwt_user: Option<(String, String)> = None;
+    match endpoint.auth_mode {
+        AuthMode::None => {}
+        AuthMode::ApiKey => {
+            let Some(secret) = app_routes.secret() else {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "config_error",
+                    "endpoint requires auth but the app has no api_key_secret",
+                );
+            };
+            let provided = headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok());
+            if !verify_api_key(provided, secret) {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "missing or invalid API key",
+                );
+            }
+        }
+        AuthMode::Jwt => {
+            let Some(app_auth) = state.app_auth(&app_id) else {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "config_error",
+                    "endpoint requires jwt auth but the app auth is not active",
+                );
+            };
+            let Some(authenticated) = app_auth.verify_bearer_user(&headers) else {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "missing or invalid access token",
+                );
+            };
+            if let Some(roles) = &endpoint.roles {
+                if !roles.contains(&authenticated.role) {
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "forbidden",
+                        "the authenticated user's role is not allowed on this endpoint",
+                    );
+                }
+            }
+            jwt_user = Some((authenticated.user_id, authenticated.role));
         }
     }
     // H1': Ist ein Gateway-Secret konfiguriert, muessen X-User-*-Header per
     // X-Internal-Auth ihre Herkunft vom Gateway belegen — sonst fallen sie
     // auf die Defaults (anonymous/user) zurueck. Ohne konfiguriertes
     // Gateway-Secret bleibt das bisherige Vertrauensmodell (dokumentiert).
-    let identity_trusted = match state.gateway_secret() {
-        Some(secret) => {
-            let provided = headers
-                .get(INTERNAL_AUTH_HEADER)
-                .and_then(|v| v.to_str().ok());
-            verify_gateway_secret(provided, secret)
+    // Praezedenz: verifiziertes JWT > Gateway-geprovene Header > Defaults.
+    let user = match jwt_user {
+        Some((id, role)) => json!({ "id": id, "role": role }),
+        None => {
+            let identity_trusted = match state.gateway_secret() {
+                Some(secret) => {
+                    let provided = headers
+                        .get(INTERNAL_AUTH_HEADER)
+                        .and_then(|v| v.to_str().ok());
+                    verify_gateway_secret(provided, secret)
+                }
+                None => true,
+            };
+            extract_user(&headers, identity_trusted)
         }
-        None => true,
     };
-    let user = extract_user(&headers, identity_trusted);
 
     // --- CRUD-Dispatch ------------------------------------------------------
     let collection = endpoint.path.trim_start_matches('/');
@@ -170,26 +272,41 @@ pub async fn handle(
     response
 }
 
-/// N1: Fuehrt `respond` nur aus, wenn der Request den App-Key besteht;
-/// Apps ohne Secret oder mit gueltigem Key sehen die echte 404/405-Antwort.
-/// Die Pruefung laeuft ausschliesslich auf Fehlerpfaden — der Hot Path
-/// (gueltige Route) zahlt nichts dafuer.
+/// N1: Fuehrt `respond` nur aus, wenn der Request die Struktur der App
+/// sehen darf. Apps mit Secret verlangen einen gueltigen API-Key; Apps mit
+/// aktiver App-Auth einen gueltigen Bearer (beide vorhanden: jedes der
+/// beiden Credentials genuegt). Die Pruefung laeuft ausschliesslich auf
+/// Fehlerpfaden — der Hot Path (gueltige Route) zahlt nichts dafuer.
 fn hidden_behind_auth(
     app_routes: &crate::state::AppRoutes,
+    app_auth: Option<&std::sync::Arc<steadfast_auth::AppAuth>>,
     headers: &HeaderMap,
     respond: impl FnOnce() -> Response,
 ) -> Response {
-    if let Some(secret) = app_routes.secret() {
+    let key_ok = app_routes.secret().is_some_and(|secret| {
         let provided = headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok());
-        if !verify_api_key(provided, secret) {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing or invalid API key",
-            );
-        }
+        verify_api_key(provided, secret)
+    });
+    let bearer_ok = app_auth.is_some_and(|auth| auth.verify_bearer(headers).is_some());
+    let needs_auth = app_routes.secret().is_some() || app_auth.is_some();
+    if needs_auth && !key_ok && !bearer_ok {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid credentials",
+        );
     }
     respond()
+}
+
+/// Liefert den Pfad unterhalb des reservierten `/_auth`-Segments, falls
+/// `rest` dorthin zeigt (`"_auth"` -> `""`, `"_auth/login"` -> `"login"`).
+fn auth_sub_path(rest: &str) -> Option<&str> {
+    if rest == steadfast_auth::AUTH_PATH_SEGMENT {
+        Some("")
+    } else {
+        rest.strip_prefix(&format!("{}/", steadfast_auth::AUTH_PATH_SEGMENT))
+    }
 }
 
 /// N5: Entfernt den Body einer vollstaendig gepufferten Response und setzt
@@ -1999,5 +2116,330 @@ api_key_secret = "gallery_secret_456"
         assert!(content_length > 0);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert!(bytes.is_empty(), "HEAD must not send a body");
+    }
+
+    // --- App-Auth: /_auth-Dispatch und auth_mode = "jwt" ------------------------
+
+    const AUTH_TEST_TOML: &str = r#"
+[apps.auth_app]
+api_key_secret = "auth_app_secret_123_geheim"
+
+  [apps.auth_app.auth]
+  enabled = true
+  jwt_secret = "auth_app_jwt_secret_0123456789abcdef"
+  registration_open = true
+  admin_email = "admin@auth.app"
+  admin_password = "Admin-Passw0rt!"
+
+    [apps.auth_app.auth.rate_limit]
+    login_per_min = 1000
+    refresh_per_min = 1000
+
+  [apps.auth_app.endpoints.notes_get]
+  path = "/notes"
+  method = "GET"
+
+  [apps.auth_app.endpoints.notes_post]
+  path = "/notes"
+  method = "POST"
+  auth_mode = "jwt"
+
+  business_logic = """
+  fn on_request(payload, user) {
+      payload.created_by = user.id;
+      return payload;
+  }
+  """
+
+  [apps.auth_app.endpoints.audit_get]
+  path = "/audit"
+  method = "GET"
+  auth_mode = "jwt"
+  roles = ["admin"]
+
+  [apps.auth_app.endpoints.machine_import]
+  path = "/imports"
+  method = "POST"
+  auth_mode = "api_key"
+
+[apps.other_app]
+
+  [apps.other_app.auth]
+  enabled = true
+  jwt_secret = "other_app_jwt_secret_9876543210fedcba"
+
+    [apps.other_app.auth.rate_limit]
+    login_per_min = 1000
+
+  [apps.other_app.endpoints.stuff_post]
+  path = "/stuff"
+  method = "POST"
+  auth_mode = "jwt"
+"#;
+
+    fn auth_router() -> axum::Router {
+        let config = EngineConfig::from_toml(AUTH_TEST_TOML).expect("auth test config");
+        build_router(
+            AppState::build_with_store(config, Arc::new(MemoryStore::new()), None).expect("state"),
+        )
+    }
+
+    /// Login ueber den VOLLSTAENDIGEN Router (Catch-All-Dispatch nach
+    /// steadfast_auth) und liefert das Access-Token.
+    async fn login_token(router: &axum::Router, app: &str, email: &str, password: &str) -> String {
+        let response = send(
+            router.clone(),
+            req_json(
+                "POST",
+                &format!("/{app}/_auth/login"),
+                &[],
+                &json!({"email": email, "password": password}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "login muss klappen");
+        let body = body_json(response).await;
+        body["access_token"].as_str().expect("token").to_string()
+    }
+
+    fn bearer(token: &str) -> Vec<(&'static str, String)> {
+        vec![("authorization", format!("Bearer {token}"))]
+    }
+
+    #[tokio::test]
+    async fn auth_dispatch_login_me_and_refresh_through_router() {
+        let router = auth_router();
+
+        // Login (Bootstrap-Admin) laeuft durch den Catch-All in den
+        // Auth-Subrouter — inklusive Security-Headern auf der Antwort.
+        let token = login_token(&router, "auth_app", "admin@auth.app", "Admin-Passw0rt!").await;
+
+        let response = send(
+            router.clone(),
+            req_auth("GET", "/auth_app/_auth/me", &bearer(&token)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let me = body_json(response).await;
+        assert_eq!(me["email"], "admin@auth.app");
+        assert_eq!(me["role"], "admin");
+
+        // Falsches Passwort: uniforme 401 invalid_credentials.
+        let response = send(
+            router.clone(),
+            req_json(
+                "POST",
+                "/auth_app/_auth/login",
+                &[],
+                &json!({"email": "admin@auth.app", "password": "falsch"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let err = body_json(response).await;
+        assert_eq!(err["error"]["code"], "invalid_credentials");
+    }
+
+    #[tokio::test]
+    async fn jwt_endpoints_gate_write_and_feed_rhai_user_context() {
+        let router = auth_router();
+        let token = login_token(&router, "auth_app", "admin@auth.app", "Admin-Passw0rt!").await;
+
+        // Ohne Token: 401; mit Token: 201 — und das Rhai-Skript sieht die
+        // Benutzer-ID aus den JWT-Claims als user.id (created_by).
+        let body = json!({"title": "erste Notiz"});
+        let response = send(
+            router.clone(),
+            req_json("POST", "/auth_app/notes", &[], &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = send(
+            router.clone(),
+            req_json("POST", "/auth_app/notes", &bearer(&token), &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let doc = body_json(response).await;
+        assert!(
+            doc["created_by"].as_str().unwrap().starts_with("u_"),
+            "user.id aus den Claims: {}",
+            doc["created_by"]
+        );
+
+        // Oeffentlicher GET bleibt offen; Bearer-Header stoeren nicht.
+        let response = send(router.clone(), req("GET", "/auth_app/notes")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // X-User-* kann die JWT-Identitaet NICHT ueberschreiben: Der
+        // gespoofte Header darf created_by nicht anfaerben.
+        let mut headers = bearer(&token);
+        headers.push(("x-user-id", "spoofed-id".to_string()));
+        let response = send(
+            router.clone(),
+            req_json("POST", "/auth_app/notes", &headers, &json!({"title": "x"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let doc = body_json(response).await;
+        assert_ne!(doc["created_by"], "spoofed-id");
+    }
+
+    #[tokio::test]
+    async fn jwt_roles_are_enforced_fresh() {
+        let router = auth_router();
+        let admin = login_token(&router, "auth_app", "admin@auth.app", "Admin-Passw0rt!").await;
+
+        // Admin darf den rollenbeschraenkten Endpunkt lesen.
+        let response = send(
+            router.clone(),
+            req_auth("GET", "/auth_app/audit", &bearer(&admin)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // "user"-Rolle (Selbstregistrierung) bekommt 403, nicht 401.
+        let response = send(
+            router.clone(),
+            req_json(
+                "POST",
+                "/auth_app/_auth/register",
+                &[],
+                &json!({"email": "leser@auth.app", "password": "Leser-Passw0rt!"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let user = login_token(&router, "auth_app", "leser@auth.app", "Leser-Passw0rt!").await;
+        let response = send(
+            router.clone(),
+            req_auth("GET", "/auth_app/audit", &bearer(&user)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Rollen-Aenderung greift sofort: Hochstufung zum admin via
+        // Admin-PATCH oeffnet den Endpunkt ohne neues Token.
+        let users = send(
+            router.clone(),
+            req_auth("GET", "/auth_app/_auth/users", &bearer(&admin)),
+        )
+        .await;
+        let users = body_json(users).await;
+        let leser_id = users["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["email"] == "leser@auth.app")
+            .expect("leser")["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = send(
+            router.clone(),
+            req_json(
+                "PATCH",
+                &format!("/auth_app/_auth/users/{leser_id}"),
+                &bearer(&admin),
+                &json!({"role": "admin"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = send(
+            router.clone(),
+            req_auth("GET", "/auth_app/audit", &bearer(&user)),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "neue Rolle greift sofort"
+        );
+    }
+
+    #[tokio::test]
+    async fn jwt_tenant_isolation_between_apps() {
+        let router = auth_router();
+        let token_a = login_token(&router, "auth_app", "admin@auth.app", "Admin-Passw0rt!").await;
+
+        // Token von auth_app hat bei other_app nichts verloren (anderer
+        // Secret + Issuer) — gleich ob der Endpunkt existiert oder nicht.
+        let response = send(
+            router.clone(),
+            req_json("POST", "/other_app/stuff", &bearer(&token_a), &json!({})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Und der Login mit den Credentials von App A schlaegt bei App B fehl.
+        let response = send(
+            router.clone(),
+            req_json(
+                "POST",
+                "/other_app/_auth/login",
+                &[],
+                &json!({"email": "admin@auth.app", "password": "Admin-Passw0rt!"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_key_and_jwt_operate_in_parallel() {
+        let router = auth_router();
+
+        // Der api_key-Endpunkt bleibt beim gewohnten X-API-Key-Modell —
+        // ein Bearer-Token ersetzt ihn nicht.
+        let response = send(
+            router.clone(),
+            req_json("POST", "/auth_app/imports", &[], &json!({"row": 1})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = send(
+            router.clone(),
+            req_json(
+                "POST",
+                "/auth_app/imports",
+                &[("x-api-key", "auth_app_secret_123_geheim".to_string())],
+                &json!({"row": 1}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn unknown_paths_of_auth_apps_are_hidden() {
+        let router = auth_router();
+        // other_app hat nur jwt-Endpunkte: unbekannte Pfade geben 401 statt
+        // 404 (N1 konsistent fuer JWT-Apps), mit Token die echte 404.
+        let response = send(router.clone(), req("GET", "/other_app/gibtsnicht")).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // other_app hat keinen Bootstrap-Admin -> Login-Loch bleibt 401
+        // (registration_open default false). Stattdessen ueber auth_app:
+        // unbekannter Pfad mit gueltigem Bearer -> echte 404.
+        let token = login_token(&router, "auth_app", "admin@auth.app", "Admin-Passw0rt!").await;
+        let response = send(
+            router.clone(),
+            req_auth("GET", "/auth_app/gibtsnicht", &bearer(&token)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // _auth-Subpfade: unbekannt -> 404 (Auth-Endpunkte sind kein
+        // Struktur-Orakel: Login/Register sind ohnehin oeffentlich bekannt).
+        let response = send(router.clone(), req("POST", "/auth_app/_auth/gibtsnicht")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // App OHNE aktive Auth: /_auth/... ist eine ganz normale (hier
+        // unkonfigurierte) Kollektion -> 404, kein Auth-Dispatch.
+        let response = send(app(), req("POST", "/minimal_app/_auth/login")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

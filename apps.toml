@@ -1,19 +1,69 @@
 # ---------------------------------------------------------------------------
-# Steadfast: Anwendungs-Konfiguration
+# Steadfast: Anwendungs-Konfiguration — Musterapp
 #
-# Jede [apps.<app_id>] Sektion definiert eine isolierte REST-API.
-# Endpunkte mit auth_required = true verlangen den Header
-#   X-API-Key: <api_key_secret der App>
-# und erhaelt in der Business-Logik die User-Metadaten aus den Headern
-#   X-User-Id / X-User-Role (MVP: Gateway-Pattern, spaeter aus JWT-Claims).
+# Eine App (`muster_app`), die alle Auth-Modi vorfuehrt:
+#   * oeffentliche GET-Liste                      GET  /muster_app/notes
+#   * JWT-geschuetztes CRUD mit Rollen            POST /muster_app/notes  (Rolle user/admin)
+#   * rollenbeschraenkter Admin-Endpunkt          GET  /muster_app/audit  (nur admin)
+#   * Maschinen-Endpunkt per API-Key              POST /muster_app/imports
+#   * Benutzer-Auth unter                         /{app}/_auth/* (login, refresh, logout, ...)
+#
+# Demo-Direct-Input. Fuer echte Deployments: Secrets per Umgebungsvariable
+# uebergeben (siehe `${...}`-Form unten), statt sie im Klartext abzulegen:
+#   Windows:  set MUSTER_JWT_SECRET=...   & set MUSTER_ADMIN_PASSWORD=...
+#   Linux:    export MUSTER_JWT_SECRET=...; export MUSTER_ADMIN_PASSWORD=...
 # ---------------------------------------------------------------------------
 
-[apps.todo_app]
-# Demo-Direct-Input. Fuer echte Deployments: Secret per Umgebungsvariable
-# uebergeben, statt es im Klartext abzulegen (mind. 16 Zeichen):
-#   api_key_secret = "${TODO_APP_SECRET}"
-#   (Windows: set TODO_APP_SECRET=...  |  Linux: export TODO_APP_SECRET=...)
-api_key_secret = "super_geheimes_todo_salt_123"
+[apps.muster_app]
+# API-Key fuer Maschinen-zu-Maschinen-Zugriff (Endpunkte mit
+# auth_mode = "api_key"). Parallel zur Benutzer-Auth — beides bleibt.
+api_key_secret = "super_geheimes_muster_salt_123"
+
+  # --- Benutzer-Auth (JWT + Refresh-Rotation) -------------------------------
+  # Aktiviert /{app}/_auth/* und erlaubt auth_mode = "jwt" auf Endpunkten.
+  # Ohne [auth]-Sektion (oder enabled = false) bleibt alles beim
+  # API-Key-/Gateway-Modell — die Auth kostet dann keinerlei Overhead.
+  [apps.muster_app.auth]
+  enabled = true
+  # Signiert die Access-Tokens (HS256). Mindestens 32 Zeichen; produktiv per
+  # Umgebungsvariable: jwt_secret = "${MUSTER_JWT_SECRET}"
+  jwt_secret = "demo_jwt_secret_0123456789abcdef012345"
+
+  # Token-Lebenszeiten (Sekunden). Access kurz (Default 15 min), Refresh
+  # lang (Default 30 Tage) — Refresh rotiert bei jeder Nutzung und spurft
+  # bei Wiederverwendung ALLE Tokens des Benutzers (Diebstahl-Alarm).
+  access_token_secs = 900
+  refresh_token_secs = 2592000
+
+  # Selbstregistrierung ueber POST /_auth/register (Default: aus — dann
+  # legen Admins Benutzer ueber POST /_auth/users an).
+  registration_open = true
+
+  # Origins, deren Browser-Clients das Refresh-Token als HttpOnly-Cookie
+  # bekommen duerfen (CSRF-Origin-Check; kein "*" moeglich). Fehlt die
+  # Liste, ist nur der Bearer-Header-Modus aktiv.
+  allowed_origins = ["http://localhost:3000", "https://muster.example.com"]
+
+  # Bootstrap-Admin: wird beim Start angelegt, falls die E-Mail fehlt
+  # (Passwort unterliegt der Passwort-Policy; produktiv per ENV:
+  #   admin_password = "${MUSTER_ADMIN_PASSWORD}").
+  admin_email = "admin@muster.example"
+  admin_password = "Muster-Admin-Passw0rt!"
+
+    # --- Passwort-Policy: jede Regel einzeln konfigurierbar -----------------
+    [apps.muster_app.auth.password_policy]
+    min_length = 10          # Minimum der Zeichenlaenge (Default 10)
+    max_length = 128         # Maximum (Default 128, hart gedeckelt auf 1024)
+    require_lowercase = true # mind. ein Kleinbuchstabe
+    require_uppercase = true # mind. ein Grossbuchstabe
+    require_digits = true    # mind. eine Ziffer
+    require_special = true   # mind. ein Sonderzeichen (kein Buchstabe/Ziffer)
+
+    # --- Rate-Limiting der Auth-Endpunkte (Token-Bucket je Client-IP) -------
+    [apps.muster_app.auth.rate_limit]
+    login_per_min = 10       # Default 10
+    register_per_min = 5     # Default 5
+    refresh_per_min = 30     # Default 30
 
   # --- CORS -----------------------------------------------------------------
   # Ohne [cors]-Sektion schickt die Engine keine Access-Control-*Header und
@@ -22,36 +72,36 @@ api_key_secret = "super_geheimes_todo_salt_123"
   # `*` ist nicht mit allow_credentials kombinierbar (Fail-Fast beim Start).
   # Der Server beantwortet OPTIONS-Preflights selbst (204) und dekoriert
   # echte Antworten mit Allow-Origin; Requests fremder Origins enden mit 403.
-  [apps.todo_app.cors]
-  allowed_origins = ["http://localhost:3000", "https://todo.example.com"]
+  [apps.muster_app.cors]
+  allowed_origins = ["http://localhost:3000", "https://muster.example.com"]
   # Optional — Defaults, falls weggelassen:
   #   allowed_methods  = alle unterstuetzten (GET, POST, PUT, PATCH, DELETE)
-  #   allowed_headers  = ["content-type", "x-api-key", "x-user-id", "x-user-role"]
+  #   allowed_headers  = ["authorization", "content-type", "x-api-key",
+  #                       "x-user-id", "x-user-role"] — inkl. authorization,
+  #                       damit Browser den Bearer-Header senden duerfen
   #   exposed_headers  = ["location"] (Response-Header, die Browser-JS lesen darf)
   #   allow_credentials = false
   #   max_age_secs     = kein Access-Control-Max-Age-Header
-  # allowed_methods = ["GET", "POST"]
-  # allowed_headers = ["content-type", "x-api-key"]
-  # exposed_headers = ["location", "x-request-id"]
-  # allow_credentials = true
-  # max_age_secs = 600
+  allow_credentials = true  # Cookie-Modus (Refresh-Cookie) benoetigt Credentials
 
-  [apps.todo_app.endpoints.tasks_get]
-  path = "/tasks"
+  # --- Oeffentlicher Endpunkt: Lesen ohne Auth ------------------------------
+  [apps.muster_app.endpoints.notes_get]
+  path = "/notes"
   method = "GET"
-  auth_required = false
   paging_default = 20
+  filter_fields = ["status"]
 
-  [apps.todo_app.endpoints.tasks_create]
-  path = "/tasks"
+  # --- JWT-CRUD: Schreiben nur mit Access-Token -----------------------------
+  # Rollen wirken FRISCH aus dem Benutzer-Dokument (Admin-Degradiierung
+  # greift sofort) und fliessen als user.id/user.role ins Rhai-Skript.
+  [apps.muster_app.endpoints.notes_create]
+  path = "/notes"
   method = "POST"
-  auth_required = true
+  auth_mode = "jwt"
+  roles = ["user", "admin"]
 
   business_logic = """
   fn on_request(payload, user) {
-      if user.role != "premium" && payload.is_priority == true {
-          throw "Nur Premium-Nutzer koennen Prioritaets-Tasks erstellen!";
-      }
       if payload.title.len() == 0 {
           throw "Titel darf nicht leer sein.";
       }
@@ -61,39 +111,43 @@ api_key_secret = "super_geheimes_todo_salt_123"
   }
   """
 
-  # --- Schema-Validierung (optional, nur POST/PUT/PATCH) --------------------
-  # Wird beim Start vorkompiliert und VOR dem Skript geprueft: fehlende
-  # Pflichtfelder oder Typverstoesse kommen als 400 mit
-  # `error.code = "validation_failed"` zurueck, bevor Daten entstehen.
-  #   required             — Pflichtfelder (bei PATCH ohne Pflicht-Check)
-  #   allow_unknown_fields — false (Default) = strikt, undeklarierte Felder abweisen
-  #   types                — Typ pro Feld: "string" | "number" | "boolean" |
-  #                          "object" | "array" | "null" |
-  #                          "date" (YYYY-MM-DD, inkl. Schaltjahre) |
-  #                          "datetime" (RFC 3339, Offset/Z ist Pflicht)
-  # Hinweis: der Schema-Block steht bewusst NACH business_logic — alles nach
-  # einer [section] gehoert dieser Sektion.
-  [apps.todo_app.endpoints.tasks_create.schema]
-  required = ["title"]
-  allow_unknown_fields = true
+    # --- Schema-Validierung (VOR dem Skript, 400 mit Details) --------------
+    [apps.muster_app.endpoints.notes_create.schema]
+    required = ["title"]
+    allow_unknown_fields = true
 
-    [apps.todo_app.endpoints.tasks_create.schema.types]
-    title = "string"
-    is_priority = "boolean"
+      [apps.muster_app.endpoints.notes_create.schema.types]
+      title = "string"
 
-  # --- Demo-Erweiterung: vollstaendiges CRUD ueber dieselbe Kollektion ---
-
-  [apps.todo_app.endpoints.tasks_replace]
-  path = "/tasks"
+  [apps.muster_app.endpoints.notes_replace]
+  path = "/notes"
   method = "PUT"
-  auth_required = true
+  auth_mode = "jwt"
+  roles = ["user", "admin"]
 
-  [apps.todo_app.endpoints.tasks_patch]
-  path = "/tasks"
+  [apps.muster_app.endpoints.notes_patch]
+  path = "/notes"
   method = "PATCH"
-  auth_required = true
+  auth_mode = "jwt"
+  roles = ["user", "admin"]
 
-  [apps.todo_app.endpoints.tasks_delete]
-  path = "/tasks"
+  [apps.muster_app.endpoints.notes_delete]
+  path = "/notes"
   method = "DELETE"
-  auth_required = true
+  auth_mode = "jwt"
+  roles = ["admin"]
+
+  # --- Rollenbeschraenkter Endpunkt: nur Admins -----------------------------
+  [apps.muster_app.endpoints.audit_get]
+  path = "/audit"
+  method = "GET"
+  auth_mode = "jwt"
+  roles = ["admin"]
+
+  # --- Maschinen-Endpunkt: klassischer API-Key ------------------------------
+  # Zeigt den Parallelbetrieb: api_key und jwt koennen in derselben App
+  # nebeneinander existieren, jeder Endpunkt entscheidet selbst.
+  [apps.muster_app.endpoints.imports_post]
+  path = "/imports"
+  method = "POST"
+  auth_mode = "api_key"

@@ -31,23 +31,28 @@ Einschätzung der Auswirkungen.
 
 ## Scope
 
-Die Engine ist als **Open-Source-Komponente hinter einem Gateway** gebaut
-(siehe `SECURITY_AUDIT_V2.md` und README "Security-Modell"): User-Auth,
-Rate-Limiting und TLS liegen beim Betreiber. Gemeldet werden sollte alles,
-was die Engine selbst betrifft — etwa Sandbox-Escapes (Rhai), Auth-Bypass
-(`X-API-Key`), Header-Spoofing (`X-User-*`, `X-Internal-Auth`), Datenkorruption
-(WAL/Snapshot) oder Injection in Filter/Sortierung.
+Die Engine unterstützt zwei Vertrauensmodelle pro App (siehe README „Security-Modell"):
+**eingebaute Benutzer-Auth** (`[apps.<id>.auth]`: Login, JWT, Refresh-Rotation, Rollen,
+Lockout, Rate-Limiting der `/_auth`-Endpunkte) und das klassische **Gateway-Modell**
+(Engine hinter einem Gateway; User-Auth, Edge-Rate-Limiting und TLS beim Betreiber).
+Gemeldet werden sollte alles, was die Engine selbst betrifft — etwa Sandbox-Escapes (Rhai),
+Auth-Bypass (`X-API-Key` oder JWT/Refresh-Logik in `steadfast-auth`), Header-Spoofing
+(`X-User-*`, `X-Internal-Auth`), Passwort-/Token-Handling (Argon2id, Rotation, Reuse-
+Detection), Datenkorruption (WAL/Snapshot) oder Injection in Filter/Sortierung.
 
 Außer Scope: Fehlkonfigurationen ohne Code-Verantwortung (z. B. fehlende
 Netzwerk-Isolation des Engine-Ports, im Klartext committe Secrets, fehlende
-Gateway-Rate-Limits) — dafür dokumentiert das Security-Modell die
+Gateway-Rate-Limits auf Daten-Endpunkten) — dafür dokumentiert das Security-Modell die
 Betreiber-Verantwortung.
 
 ## Bekannte bewusste Grenzen
 
 Diese Punkte sind dokumentiert und bewusst (siehe Audit-Report):
 
-- Kein Audit-Trail (Phase 3).
+- Kein Audit-Trail jenseits strukturierter Logzeilen (Phase 3).
 - Ohne gesetztes `ENGINE_GATEWAY_SECRET` werden `X-User-*`-Header
-  unverifiziert honoring (Gateway-Vertrauensmodell).
-- Rate-Limiting/Timeouts liegen beim Gateway.
+  unverifiziert honoring (Gateway-Vertrauensmodell) — gilt nur für Apps
+  ohne aktive `[auth]`-Sektion; bei `auth_mode = "jwt"` stammt die Identität
+  aus verifizierten Token-Claims.
+- Rate-Limiting/Timeouts der Daten-Endpunkte liegen beim Gateway (die
+  `/_auth`-Endpunkte haben ein eigenes Token-Bucket-Rate-Limit je Client-IP).

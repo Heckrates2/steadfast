@@ -297,6 +297,22 @@ async fn main() -> ExitCode {
         "configuration loaded and scripts precompiled"
     );
 
+    // Auth-Sweeper: raeumt abgelaufene Refresh-Tokens und leere Rate-Limit-
+    // Buckets aller aktiven App-Auths weg (endet nie; stirbt mit dem
+    // Runtime-Shutdown sauber mit).
+    let auth_handles = state.auth_handles();
+    if auth_handles.is_empty() {
+        tracing::debug!("keine App-Auth aktiv — Sweeper bleibt aus");
+    } else {
+        // Der Task lebt unabhaengig vom Handle weiter (JoinHandle-Drop
+        // detached nur das Join, kein abort).
+        let _sweeper = steadfast_auth::spawn_sweeper(auth_handles, steadfast_auth::SWEEP_INTERVAL);
+        tracing::info!(
+            apps = state.summary().0,
+            "Auth-Sweeper aktiv (Intervall: 10 Minuten)"
+        );
+    }
+
     let app = router::build_router(state);
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(listener) => listener,
@@ -309,24 +325,27 @@ async fn main() -> ExitCode {
 
     // H1: Der Default-Bind ist die Loopback-Schnittstelle. Ein oeffentlicher
     // Bind ist der Normalbetrieb, verdient aber einen sichtbaren Hinweis auf
-    // die Grenzen des Sicherheitsmodells (spoofbare X-User-Header, kein
-    // Rate-Limiting im MVP). Hostnamen ("localhost:8080") parst SocketAddr
-    // nicht — sie bleiben ohne Warnung, was harmlos ist.
+    // die Grenzen des Sicherheitsmodells (spoofbare X-User-Header ohne
+    // Gateway-Secret, kein Rate-Limiting auf den Daten-Endpunkten).
+    // Hostnamen ("localhost:8080") parst SocketAddr nicht — sie bleiben ohne
+    // Warnung, was harmlos ist.
     if let Ok(addr) = bind_addr.parse::<std::net::SocketAddr>() {
         if !addr.ip().is_loopback() {
             tracing::warn!(
                 %bind_addr,
-                "binding to a non-loopback address — die Engine vertraut den Headern \
-                 X-User-Id/X-User-Role und hat im Monolith-Modus kein Rate-Limiting; \
-                 im Netzwerkbetrieb nur hinter einem Gateway einsetzen, das diese \
-                 Header aus Client-Requests entfernt"
+                "binding to a non-loopback address — ohne Gateway-Secret vertraut die Engine \
+                 den Headern X-User-Id/X-User-Role; Auth-Endpunkte haben eigenes Rate-Limiting, \
+                 die Daten-Endpunkte nicht — im Netzwerkbetrieb nur hinter einem Gateway einsetzen"
             );
         }
     }
 
-    if let Err(err) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
+    if let Err(err) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
     {
         if let Some(persistence) = persistence {
             let _ = persistence.shutdown(&store);

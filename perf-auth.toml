@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# Bench-App fuer Lasttests MIT Auth (perf-auth.toml).
+#
+# Gleiche Dokumentform wie perf.toml (5000 Docs, grp/flag/summe/titel), aber
+# zwei parallele Kollektionen: /items oeffentlich (Baseline) und /secure mit
+# auth_mode = "jwt" (misst die JWT-Verifizierung + den frischen User-Lookup
+# pro Request). Beide Seen mit je 5000 Docs ergeben einen sauberen
+# Vergleich auf derselben Maschine.
+#
+# Start (RAM-only):
+#   target\release\steadfast.exe perf-auth.toml 127.0.0.1:8082
+#
+# Login (Token fuer die /secure-Laeufe):
+#   curl -X POST http://127.0.0.1:8082/perf_auth_app/_auth/login \
+#     -H "content-type: application/json" \
+#     -d '{"email":"admin@perf.local","password":"Perf-Admin-Passw0rt!"}'
+#
+# Seeden (je 5000 Docs, 5 Batches mit fester grp/summe-Kombination):
+#   loadtest --url .../perf_auth_app/items   --requests 1000 --method POST --body "..."
+#   loadtest --url .../perf_auth_app/secure  --requests 1000 --method POST \
+#            --header "authorization: Bearer <TOKEN>" --body "..."
+# ---------------------------------------------------------------------------
+
+[apps.perf_auth_app]
+
+  [apps.perf_auth_app.auth]
+  enabled = true
+  jwt_secret = "perf_auth_jwt_secret_0123456789abc"
+  admin_email = "admin@perf.local"
+  admin_password = "Perf-Admin-Passw0rt!"
+
+  # --- Baseline: identische Endpunkte wie perf.toml, ohne Auth --------------
+  [apps.perf_auth_app.endpoints.items_get]
+  path = "/items"
+  method = "GET"
+  paging_default = 20
+  filter_fields = ["grp", "flag", "summe", "titel"]
+
+  [apps.perf_auth_app.endpoints.items_post]
+  path = "/items"
+  method = "POST"
+
+  # --- Messstrecke: dieselbe Form, aber JWT-geschuetzt -----------------------
+  [apps.perf_auth_app.endpoints.secure_get]
+  path = "/secure"
+  method = "GET"
+  auth_mode = "jwt"
+  paging_default = 20
+  filter_fields = ["grp", "flag", "summe", "titel"]
+
+  [apps.perf_auth_app.endpoints.secure_post]
+  path = "/secure"
+  method = "POST"
+  auth_mode = "jwt"

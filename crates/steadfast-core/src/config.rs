@@ -19,6 +19,23 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// Mindestlaenge fuer `api_key_secret` (nach `${ENV_VAR}`-Aufloesung) —
 /// grob genug, um Brute-Force auf kurze Keys unattraktiv zu machen.
 pub const MIN_API_KEY_SECRET_LEN: usize = 16;
+/// Mindestlaenge fuer `auth.jwt_secret` (nach `${ENV_VAR}`-Aufloesung).
+/// HS256-Sicherheit haengt an der Entropie des Secrets; 32 Zeichen sind das
+/// Minimum fuer einen vollstaendig besetzten SHA-256/HMAC-Zustand.
+pub const MIN_JWT_SECRET_LEN: usize = 32;
+/// Harte Obergrenze fuer `auth.password_policy.max_length`: Argon2 hasht
+/// beliebige Eingabelaengen — ohne Deckel koennte ein Angreifer mit riesigen
+/// Passwort-Strings CPU/RAM auf dem Login-Endpunkt verbrennen (DoS).
+pub const HARD_MAX_PASSWORD_LEN: usize = 1024;
+/// Maximale Anzahl Eintraege in `roles` eines Endpunkts.
+pub const MAX_ENDPOINT_ROLES: usize = 8;
+/// Default/Range-Grenzen der Token-Lebenszeiten (Sekunden).
+pub const DEFAULT_ACCESS_TOKEN_SECS: u64 = 900;
+pub const MIN_ACCESS_TOKEN_SECS: u64 = 60;
+pub const MAX_ACCESS_TOKEN_SECS: u64 = 86_400;
+pub const DEFAULT_REFRESH_TOKEN_SECS: u64 = 2_592_000;
+pub const MIN_REFRESH_TOKEN_SECS: u64 = 3_600;
+pub const MAX_REFRESH_TOKEN_SECS: u64 = 31_536_000;
 
 /// Ober grenze fuer `cors.max_age_secs` (24 h). Browser deckeln den Preflight-
 /// Cache ohnehin selbst; groessere Werte sind ein Config-Fehler.
@@ -38,8 +55,15 @@ const ALL_HTTP_METHODS: [HttpMethod; 5] = [
 /// Default-Allowlist fuer `Access-Control-Allow-Headers`: genau die Header,
 /// die die Engine selbst aus Requests liest. (Bewusst OHNE `X-Internal-Auth`
 /// — das ist ein Gateway-interner Header und gehoert nicht in Browser-
-/// Preflights.)
-const DEFAULT_CORS_HEADERS: [&str; 4] = ["content-type", "x-api-key", "x-user-id", "x-user-role"];
+/// Preflights. `authorization` gehoert dazu, seit Endpunkte per
+/// `auth_mode = "jwt"` Bearer-Tokens lesen.)
+const DEFAULT_CORS_HEADERS: [&str; 5] = [
+    "authorization",
+    "content-type",
+    "x-api-key",
+    "x-user-id",
+    "x-user-role",
+];
 
 /// Default fuer `cors.exposed_headers`: `Location` auf 201 Created ist der
 /// einzige eigene Header, den die Engine sendet — und er ist NICHT
@@ -95,7 +119,54 @@ struct AppConfigRaw {
     #[serde(default)]
     cors: Option<CorsConfigRaw>,
     #[serde(default)]
+    auth: Option<AuthConfigRaw>,
+    #[serde(default)]
     endpoints: HashMap<String, EndpointRaw>,
+}
+
+/// Rohe `[apps.<id>.auth]`-Sektion: per-App Benutzer-Authentifizierung
+/// (JWT + Refresh-Rotation). `deny_unknown_fields` macht Tippfehler zu
+/// Startfehlern, statt Auth-Einstellungen still zu ignorieren.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthConfigRaw {
+    #[serde(default)]
+    enabled: bool,
+    jwt_secret: Option<String>,
+    access_token_secs: Option<u64>,
+    refresh_token_secs: Option<u64>,
+    #[serde(default)]
+    registration_open: bool,
+    allowed_origins: Option<Vec<String>>,
+    admin_email: Option<String>,
+    admin_password: Option<String>,
+    #[serde(default)]
+    password_policy: PasswordPolicyRaw,
+    #[serde(default)]
+    rate_limit: AuthRateLimitRaw,
+}
+
+/// Rohe `[apps.<id>.auth.password_policy]`-Sektion — jede Regel einzeln
+/// konfigurierbar; fehlende Felder bekommen die Defaults.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordPolicyRaw {
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+    require_lowercase: Option<bool>,
+    require_uppercase: Option<bool>,
+    require_digits: Option<bool>,
+    require_special: Option<bool>,
+}
+
+/// Rohe `[apps.<id>.auth.rate_limit]`-Sektion (Anfragen pro Minute je
+/// Client-IP, Token-Bucket).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthRateLimitRaw {
+    login_per_min: Option<u64>,
+    register_per_min: Option<u64>,
+    refresh_per_min: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +186,11 @@ struct EndpointRaw {
     method: String,
     #[serde(default)]
     auth_required: bool,
+    /// Neu: `"api_key"` oder `"jwt"` (schliesst `auth_required = true` aus).
+    /// Ohne Angabe gilt weiterhin `auth_required`.
+    auth_mode: Option<String>,
+    /// Rollen-Allowlist, nur mit `auth_mode = "jwt"`.
+    roles: Option<Vec<String>>,
     paging_default: Option<usize>,
     filter_fields: Option<Vec<String>>,
     business_logic: Option<String>,
@@ -147,7 +223,13 @@ pub struct EndpointRuntime {
     /// Normalisierter Kollektions-Pfad, z. B. "/tasks".
     pub path: String,
     pub method: HttpMethod,
-    pub auth_required: bool,
+    /// Authentifizierungsmodus (loest `auth_required` ab; `auth_required`
+    /// bleibt als Kurzform fuer `auth_mode = "api_key"` in der TOML).
+    pub auth_mode: AuthMode,
+    /// Rollen-Allowlist (nur `AuthMode::Jwt`): Rolle des Benutzers (frisch
+    /// aus dem User-Dokument) muss in dieser Liste stehen, sonst 403.
+    /// `None` = jeder authentifizierte Benutzer der App.
+    pub roles: Option<Arc<[String]>>,
     /// Seitengroesse fuer GET-Listen ohne explizites `?limit=`.
     pub paging_default: usize,
     /// Optionale Allowlist filterbarer Felder.
@@ -239,11 +321,141 @@ impl CorsConfig {
     }
 }
 
+/// Authentifizierungsmodus eines Endpunkts. `None` = oeffentlich (bisher
+/// `auth_required = false`), `ApiKey` = bisheriges `auth_required = true`
+/// (`X-API-Key`), `Jwt` = Bearer-Access-Token der App-Auth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Oeffentlicher Endpunkt.
+    None,
+    /// `X-API-Key` gegen das App-Secret (bisheriges Verhalten).
+    ApiKey,
+    /// `Authorization: Bearer <JWT>` gegen den JWT-Secret der App.
+    Jwt,
+}
+
+impl AuthMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthMode::None => "none",
+            AuthMode::ApiKey => "api_key",
+            AuthMode::Jwt => "jwt",
+        }
+    }
+}
+
+/// Passwort-Regeln einer App-Auth — jede Regel einzeln per TOML schaltbar.
+/// `check` liefert die verletzten Regeln als statische Meldungen fuer den
+/// 400-Body (nur bei Registrierung/Admin-Anlage; der Login antwortet
+/// grundsätzlich generisch, um kein Policy-Orakel zu sein).
+#[derive(Debug, Clone)]
+pub struct PasswordPolicy {
+    pub min_length: usize,
+    pub max_length: usize,
+    pub require_lowercase: bool,
+    pub require_uppercase: bool,
+    pub require_digits: bool,
+    /// Mind. ein Zeichen, das weder Buchstabe noch Ziffer ist (Unicode-
+    /// bewusst: jedes nicht-alphanumerische Zeichen zaehlt als Sonderzeichen).
+    pub require_special: bool,
+}
+
+impl Default for PasswordPolicy {
+    fn default() -> Self {
+        Self {
+            min_length: 10,
+            max_length: 128,
+            require_lowercase: true,
+            require_uppercase: true,
+            require_digits: true,
+            require_special: true,
+        }
+    }
+}
+
+impl PasswordPolicy {
+    /// Prueft ein Passwort gegen alle Regeln. Ok bei leerer Verstoßliste.
+    pub fn check(&self, password: &str) -> Result<(), Vec<&'static str>> {
+        let mut violations = Vec::new();
+        let chars = password.chars().count();
+        if chars < self.min_length {
+            violations.push("password must be at least {min_length} characters long");
+        }
+        if chars > self.max_length {
+            violations.push("password must be at most {max_length} characters long");
+        }
+        if self.require_lowercase && !password.chars().any(|c| c.is_lowercase()) {
+            violations.push("password must contain a lowercase letter");
+        }
+        if self.require_uppercase && !password.chars().any(|c| c.is_uppercase()) {
+            violations.push("password must contain an uppercase letter");
+        }
+        if self.require_digits && !password.chars().any(|c| c.is_ascii_digit()) {
+            violations.push("password must contain a digit");
+        }
+        if self.require_special && !password.chars().any(|c| !c.is_alphanumeric()) {
+            violations.push("password must contain a special character (not a letter or digit)");
+        }
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+}
+
+/// Rate-Limit-Deckel der Auth-Endpunkte (Token-Bucket je Client-IP und App):
+/// Capacity = angegebener Wert, Auffuellung = Wert/60 pro Sekunde.
+#[derive(Debug, Clone)]
+pub struct AuthRateLimit {
+    pub login_per_min: u64,
+    pub register_per_min: u64,
+    pub refresh_per_min: u64,
+}
+
+impl Default for AuthRateLimit {
+    fn default() -> Self {
+        Self {
+            login_per_min: 10,
+            register_per_min: 5,
+            refresh_per_min: 30,
+        }
+    }
+}
+
+/// Bootstrap-Admin einer App-Auth: wird beim Start angelegt, falls die
+/// E-Mail noch nicht existiert (Passwort unterliegt der Passwort-Policy).
+#[derive(Debug, Clone)]
+pub struct AdminBootstrap {
+    pub email: String,
+    pub password: String,
+}
+
+/// Fertig validierte `[apps.<id>.auth]`-Einstellungen. Nur aktiv
+/// (`AppConfigRuntime::auth = Some`) wenn `enabled = true` — ansonsten
+/// bleibt die App beim bisherigen Verhalten (API-Key/Gateway-Modell).
+#[derive(Debug, Clone)]
+pub struct AuthSettings {
+    /// Aufgeloester JWT-Signatur-Schluessel (HS256), nie im Klartext loggen.
+    pub jwt_secret: Arc<str>,
+    pub access_token_secs: u64,
+    pub refresh_token_secs: u64,
+    pub registration_open: bool,
+    /// Origins fuer den Cookie-Modus (CSRF-Origin-Check), lowercase sortiert.
+    /// `None` = keine Cookie-Herkunft freigegeben (nur Bearer-Modus).
+    pub allowed_origins: Option<Arc<[String]>>,
+    pub admin: Option<AdminBootstrap>,
+    pub password_policy: PasswordPolicy,
+    pub rate_limit: AuthRateLimit,
+}
+
 /// Eine Anwendung: Secret plus alle Endpunkte (Schluessel = Endpunktname).
 #[derive(Debug, Clone)]
 pub struct AppConfigRuntime {
     pub api_key_secret: Option<Arc<str>>,
     pub cors: Option<Arc<CorsConfig>>,
+    /// Aktive App-Auth (`[auth]` mit `enabled = true`), sonst `None`.
+    pub auth: Option<Arc<AuthSettings>>,
     pub endpoints: HashMap<String, Arc<EndpointRuntime>>,
 }
 
@@ -301,7 +513,7 @@ fn validate_and_compile(
         let secret = match &raw_app.api_key_secret {
             None => None,
             Some(raw) => {
-                let resolved = resolve_api_key_secret(&app_id, raw, &env_lookup)?;
+                let resolved = resolve_secret(&app_id, "api_key_secret", raw, &env_lookup)?;
                 if resolved.chars().count() < MIN_API_KEY_SECRET_LEN {
                     return Err(EngineError::Config(format!(
                         "app `{app_id}`: api_key_secret must be at least {MIN_API_KEY_SECRET_LEN} characters"
@@ -319,6 +531,13 @@ fn validate_and_compile(
         let cors = match raw_app.cors {
             None => None,
             Some(raw_cors) => Some(Arc::new(validate_cors(&app_id, raw_cors)?)),
+        };
+
+        // App-Auth vor den Endpunkten aufloesen: Der `auth_mode = "jwt"`
+        // Check jedes Endpunkts braucht das Ergebnis.
+        let auth = match raw_app.auth {
+            None => None,
+            Some(raw_auth) => validate_auth_settings(&app_id, raw_auth, &env_lookup)?.map(Arc::new),
         };
 
         let mut endpoints = HashMap::new();
@@ -374,12 +593,100 @@ fn validate_and_compile(
                 }
             };
 
-            if raw_ep.auth_required && secret.is_none() {
+            // Auth-Modus: `auth_mode` (neu) oder `auth_required` (Kurzform
+            // fuer "api_key"). Beide zusammen sind mehrdeutig -> Fail-Fast.
+            let auth_mode = match raw_ep.auth_mode.as_deref() {
+                None => {
+                    if raw_ep.auth_required {
+                        AuthMode::ApiKey
+                    } else {
+                        AuthMode::None
+                    }
+                }
+                Some("api_key") => {
+                    if raw_ep.auth_required {
+                        return Err(EngineError::Config(format!(
+                            "app `{app_id}`, endpoint `{endpoint_name}`: \
+                             auth_mode and auth_required = true say the same thing twice — \
+                             pick auth_mode = \"api_key\" or auth_required (not both)"
+                        )));
+                    }
+                    AuthMode::ApiKey
+                }
+                Some("jwt") => {
+                    if raw_ep.auth_required {
+                        return Err(EngineError::Config(format!(
+                            "app `{app_id}`, endpoint `{endpoint_name}`: \
+                             auth_mode = \"jwt\" cannot be combined with auth_required = true \
+                             (that would demand API key AND JWT)"
+                        )));
+                    }
+                    if auth.is_none() {
+                        return Err(EngineError::Config(format!(
+                            "app `{app_id}`, endpoint `{endpoint_name}`: \
+                             auth_mode = \"jwt\" requires an enabled [auth] section on the app"
+                        )));
+                    }
+                    AuthMode::Jwt
+                }
+                Some(other) => {
+                    return Err(EngineError::Config(format!(
+                        "app `{app_id}`, endpoint `{endpoint_name}`: unknown auth_mode \
+                         `{other}` (allowed: \"api_key\", \"jwt\")"
+                    )));
+                }
+            };
+            if auth_mode == AuthMode::ApiKey && secret.is_none() {
                 return Err(EngineError::Config(format!(
-                    "app `{app_id}`, endpoint `{endpoint_name}`: auth_required = true \
+                    "app `{app_id}`, endpoint `{endpoint_name}`: auth (api_key) \
                      requires api_key_secret on the app"
                 )));
             }
+            // Aktivierte App-Auth betreibt den `/_auth`-Subrouter — der
+            // Kollektionspfad dorthin ist dann reserviert.
+            if auth.is_some() && path == "/_auth" {
+                return Err(EngineError::Config(format!(
+                    "app `{app_id}`, endpoint `{endpoint_name}`: path `/_auth` is reserved \
+                     for the app auth endpoints while [auth] is enabled"
+                )));
+            }
+
+            let roles = match raw_ep.roles {
+                None => None,
+                Some(roles) => {
+                    if auth_mode != AuthMode::Jwt {
+                        return Err(EngineError::Config(format!(
+                            "app `{app_id}`, endpoint `{endpoint_name}`: roles require \
+                             auth_mode = \"jwt\" (API-key requests carry no role)"
+                        )));
+                    }
+                    if roles.is_empty() {
+                        return Err(EngineError::Config(format!(
+                            "app `{app_id}`, endpoint `{endpoint_name}`: roles must not be \
+                             empty (an empty allowlist could never match — remove the key to \
+                             allow every authenticated user)"
+                        )));
+                    }
+                    if roles.len() > MAX_ENDPOINT_ROLES {
+                        return Err(EngineError::Config(format!(
+                            "app `{app_id}`, endpoint `{endpoint_name}`: at most \
+                             {MAX_ENDPOINT_ROLES} roles per endpoint"
+                        )));
+                    }
+                    for role in &roles {
+                        validate_role_name(role).map_err(|reason| {
+                            EngineError::Config(format!(
+                                "app `{app_id}`, endpoint `{endpoint_name}`: invalid role \
+                                 `{role}`: {reason}"
+                            ))
+                        })?;
+                    }
+                    let mut unique = roles;
+                    unique.sort();
+                    unique.dedup();
+                    Some(unique.into())
+                }
+            };
 
             let paging_default = match raw_ep.paging_default {
                 None => DEFAULT_PAGE_SIZE,
@@ -430,7 +737,8 @@ fn validate_and_compile(
                     name: endpoint_name,
                     path,
                     method,
-                    auth_required: raw_ep.auth_required,
+                    auth_mode,
+                    roles,
                     paging_default,
                     filter_fields,
                     schema,
@@ -444,6 +752,7 @@ fn validate_and_compile(
             AppConfigRuntime {
                 api_key_secret: secret.map(Into::into),
                 cors,
+                auth,
                 endpoints,
             },
         );
@@ -452,13 +761,231 @@ fn validate_and_compile(
     Ok(EngineConfig { apps })
 }
 
-/// Löst die `${ENV_VAR}`-Indirection fuer `api_key_secret` auf: Exakt die
-/// Form `${NAME}` wird beim Start aus der Umgebung gelesen (Fail-Fast bei
+/// Validiert die `[auth]`-Sektion einer App. `Ok(None)` = deaktiviert
+/// (`enabled = false` oder gar nicht gesetzt) — die App bleibt dann beim
+/// API-Key/Gateway-Modell. `Ok(Some)` = aktive Auth-Settings.
+fn validate_auth_settings(
+    app_id: &str,
+    raw: AuthConfigRaw,
+    env_lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<AuthSettings>, EngineError> {
+    if !raw.enabled {
+        return Ok(None);
+    }
+
+    // JWT-Secret: Pflicht, ${ENV}-Indirektion wie beim API-Key, min 32 Zeichen.
+    let jwt_secret = raw.jwt_secret.ok_or_else(|| {
+        EngineError::Config(format!(
+            "app `{app_id}`: auth.enabled = true requires auth.jwt_secret \
+             (min {MIN_JWT_SECRET_LEN} chars; `${{ENV_VAR}}` indirection recommended)"
+        ))
+    })?;
+    let jwt_secret = resolve_secret(app_id, "auth.jwt_secret", &jwt_secret, env_lookup)?;
+    if jwt_secret.chars().count() < MIN_JWT_SECRET_LEN {
+        return Err(EngineError::Config(format!(
+            "app `{app_id}`: auth.jwt_secret must be at least {MIN_JWT_SECRET_LEN} characters"
+        )));
+    }
+
+    let access_token_secs = match raw.access_token_secs {
+        None => DEFAULT_ACCESS_TOKEN_SECS,
+        Some(secs) if (MIN_ACCESS_TOKEN_SECS..=MAX_ACCESS_TOKEN_SECS).contains(&secs) => secs,
+        Some(secs) => {
+            return Err(EngineError::Config(format!(
+                "app `{app_id}`: auth.access_token_secs = {secs} is outside \
+                 {MIN_ACCESS_TOKEN_SECS}..={MAX_ACCESS_TOKEN_SECS}"
+            )));
+        }
+    };
+    let refresh_token_secs = match raw.refresh_token_secs {
+        None => DEFAULT_REFRESH_TOKEN_SECS,
+        Some(secs) if (MIN_REFRESH_TOKEN_SECS..=MAX_REFRESH_TOKEN_SECS).contains(&secs) => secs,
+        Some(secs) => {
+            return Err(EngineError::Config(format!(
+                "app `{app_id}`: auth.refresh_token_secs = {secs} is outside \
+                 {MIN_REFRESH_TOKEN_SECS}..={MAX_REFRESH_TOKEN_SECS}"
+            )));
+        }
+    };
+
+    // Origins fuer den Cookie-Modus: exakte Origins, kein `*` (Credentials +
+    // Wildcard schliessen sich aus; der Origin-Check ist der CSRF-Schutz).
+    let allowed_origins = match raw.allowed_origins {
+        None => None,
+        Some(origins) => {
+            if origins.is_empty() {
+                return Err(EngineError::Config(format!(
+                    "app `{app_id}`: auth.allowed_origins must not be empty \
+                     (remove the key to disable the cookie mode)"
+                )));
+            }
+            let mut normalized = Vec::with_capacity(origins.len());
+            for origin in &origins {
+                if origin == "*" {
+                    return Err(EngineError::Config(format!(
+                        "app `{app_id}`: auth.allowed_origins cannot use `*` — the cookie \
+                         mode checks an exact Origin (CSRF protection)"
+                    )));
+                }
+                validate_origin(origin).map_err(|reason| {
+                    EngineError::Config(format!(
+                        "app `{app_id}`: auth.allowed_origins entry `{origin}`: {reason}"
+                    ))
+                })?;
+                normalized.push(origin.to_ascii_lowercase());
+            }
+            normalized.sort();
+            normalized.dedup();
+            Some(normalized.into())
+        }
+    };
+
+    // Bootstrap-Admin: nur paarweise (E-Mail + Passwort) sinnvoll.
+    let admin = match (raw.admin_email, raw.admin_password) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(EngineError::Config(format!(
+                "app `{app_id}`: auth.admin_email and auth.admin_password must be set together"
+            )));
+        }
+        (Some(email), Some(password)) => Some(AdminBootstrap {
+            email: validate_email(app_id, &email)?,
+            password: resolve_secret(app_id, "auth.admin_password", &password, env_lookup)?,
+        }),
+    };
+
+    // Passwort-Policy; das Bootstrap-Passwort unterliegt derselben Policy
+    // (Fail-Fast beim Start statt eines nie funktionierenden Admin-Logins).
+    let password_policy = validate_password_policy(app_id, raw.password_policy)?;
+    if let Some(admin) = &admin {
+        if let Err(violations) = password_policy.check(&admin.password) {
+            return Err(EngineError::Config(format!(
+                "app `{app_id}`: auth.admin_password violates the password policy: {}",
+                violations.join("; ")
+            )));
+        }
+    }
+
+    let rate_limit = validate_rate_limit(app_id, raw.rate_limit)?;
+
+    Ok(Some(AuthSettings {
+        jwt_secret: jwt_secret.into(),
+        access_token_secs,
+        refresh_token_secs,
+        registration_open: raw.registration_open,
+        allowed_origins,
+        admin,
+        password_policy,
+        rate_limit,
+    }))
+}
+
+/// Passwort-Policy: Laengen gedeckelt (`max <= HARD_MAX_PASSWORD_LEN`,
+/// `min <= max`), Klassenregeln sind freie Schalter.
+fn validate_password_policy(
+    app_id: &str,
+    raw: PasswordPolicyRaw,
+) -> Result<PasswordPolicy, EngineError> {
+    let defaults = PasswordPolicy::default();
+    let min_length = raw.min_length.unwrap_or(defaults.min_length);
+    let max_length = raw.max_length.unwrap_or(defaults.max_length);
+    if min_length < 1 {
+        return Err(EngineError::Config(format!(
+            "app `{app_id}`: auth.password_policy.min_length must be >= 1"
+        )));
+    }
+    if max_length > HARD_MAX_PASSWORD_LEN {
+        return Err(EngineError::Config(format!(
+            "app `{app_id}`: auth.password_policy.max_length must be <= {HARD_MAX_PASSWORD_LEN} \
+             (hard cap against Argon2 DoS)"
+        )));
+    }
+    if min_length > max_length {
+        return Err(EngineError::Config(format!(
+            "app `{app_id}`: auth.password_policy.min_length ({min_length}) must not exceed \
+             max_length ({max_length})"
+        )));
+    }
+    Ok(PasswordPolicy {
+        min_length,
+        max_length,
+        require_lowercase: raw.require_lowercase.unwrap_or(defaults.require_lowercase),
+        require_uppercase: raw.require_uppercase.unwrap_or(defaults.require_uppercase),
+        require_digits: raw.require_digits.unwrap_or(defaults.require_digits),
+        require_special: raw.require_special.unwrap_or(defaults.require_special),
+    })
+}
+
+fn validate_rate_limit(app_id: &str, raw: AuthRateLimitRaw) -> Result<AuthRateLimit, EngineError> {
+    let defaults = AuthRateLimit::default();
+    let check = |name: &str, value: Option<u64>, default: u64| -> Result<u64, EngineError> {
+        match value {
+            None => Ok(default),
+            Some(v) if (1..=10_000).contains(&v) => Ok(v),
+            Some(v) => Err(EngineError::Config(format!(
+                "app `{app_id}`: auth.rate_limit.{name} = {v} is outside 1..=10000"
+            ))),
+        }
+    };
+    Ok(AuthRateLimit {
+        login_per_min: check("login_per_min", raw.login_per_min, defaults.login_per_min)?,
+        register_per_min: check(
+            "register_per_min",
+            raw.register_per_min,
+            defaults.register_per_min,
+        )?,
+        refresh_per_min: check(
+            "refresh_per_min",
+            raw.refresh_per_min,
+            defaults.refresh_per_min,
+        )?,
+    })
+}
+
+/// Einfache E-Mail-Pruefung fuer Identifikatoren (keine SMTP-Validierung):
+/// ASCII, druckbar, genau ein `@`, beide Seiten nichtleer, max. 254 Zeichen.
+fn validate_email(app_id: &str, email: &str) -> Result<String, EngineError> {
+    let ok = (3..=254).contains(&email.len())
+        && email.is_ascii()
+        && !email.contains(char::is_whitespace)
+        && email.matches('@').count() == 1
+        && {
+            let (local, domain) = email.split_once('@').expect("genau ein @");
+            !local.is_empty() && !domain.is_empty()
+        };
+    if ok {
+        Ok(email.to_ascii_lowercase())
+    } else {
+        Err(EngineError::Config(format!(
+            "app `{app_id}`: invalid email `{email}` (ASCII, exactly one `@`, non-empty \
+             local part and domain, 3..=254 chars)"
+        )))
+    }
+}
+
+/// Rollennamen: `[A-Za-z0-9_-]`, max. 32 Zeichen — Rollen landen in JWTs,
+/// Store-Dokumenten und Konfigurationen und sollten dort unauffaellig bleiben.
+fn validate_role_name(role: &str) -> Result<(), String> {
+    let ok = !role.is_empty()
+        && role.len() <= 32
+        && role
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        Err("must match [A-Za-z0-9_-] (1..=32 chars)".into())
+    }
+}
+
+/// Löst die `${ENV_VAR}`-Indirection fuer Secrets auf: Exakt die Form
+/// `${NAME}` wird beim Start aus der Umgebung gelesen (Fail-Fast bei
 /// fehlender oder leerer Variable). Alles andere bleibt literal — Klartext
 /// in der apps.toml ist weiterhin erlaubt (Demo/Dev), die Indirection ist
 /// der empfohlene Weg fuer den Betrieb.
-fn resolve_api_key_secret(
+fn resolve_secret(
     app_id: &str,
+    field: &str,
     raw: &str,
     env_lookup: &impl Fn(&str) -> Option<String>,
 ) -> Result<String, EngineError> {
@@ -471,16 +998,16 @@ fn resolve_api_key_secret(
     let name = inner.trim();
     if name.is_empty() {
         return Err(EngineError::Config(format!(
-            "app `{app_id}`: api_key_secret `${{...}}` names an empty environment variable"
+            "app `{app_id}`: {field} `${{...}}` names an empty environment variable"
         )));
     }
     match env_lookup(name) {
         Some(value) if !value.is_empty() => Ok(value),
         Some(_) => Err(EngineError::Config(format!(
-            "app `{app_id}`: environment variable `{name}` (api_key_secret) is set but empty"
+            "app `{app_id}`: environment variable `{name}` ({field}) is set but empty"
         ))),
         None => Err(EngineError::Config(format!(
-            "app `{app_id}`: environment variable `{name}` (api_key_secret) is not set — \
+            "app `{app_id}`: environment variable `{name}` ({field}) is not set — \
              export it before starting the engine"
         ))),
     }
@@ -839,12 +1366,12 @@ api_key_secret = "super_geheimes_todo_salt_123"
         let get = app.endpoints.get("tasks_get").unwrap();
         assert_eq!(get.path, "/tasks");
         assert_eq!(get.method, HttpMethod::Get);
-        assert!(!get.auth_required);
+        assert_eq!(get.auth_mode, AuthMode::None);
         assert_eq!(get.paging_default, 20);
         assert!(get.script.is_none());
 
         let create = app.endpoints.get("tasks_create").unwrap();
-        assert!(create.auth_required);
+        assert_eq!(create.auth_mode, AuthMode::ApiKey);
         assert!(
             create.script.is_some(),
             "business_logic must be precompiled"
@@ -1377,7 +1904,13 @@ api_key_secret = "pa$$w0rd-${not_a_var}"
         );
         assert_eq!(
             cors.allowed_headers.as_ref(),
-            ["content-type", "x-api-key", "x-user-id", "x-user-role"]
+            [
+                "authorization",
+                "content-type",
+                "x-api-key",
+                "x-user-id",
+                "x-user-role"
+            ]
         );
         assert!(!cors.allow_credentials);
         assert!(cors.max_age_secs.is_none());
@@ -1606,5 +2139,419 @@ api_key_secret = "pa$$w0rd-${not_a_var}"
         let src = src.replace("max_age_secs = 0", "max_age_secs = 100000");
         let err = EngineConfig::from_toml(&src).unwrap_err();
         assert!(err.message().contains("max_age_secs"), "{err}");
+    }
+
+    // --- App-Auth ([apps.x.auth], auth_mode, roles) -----------------------------
+
+    /// Minimal-Config mit aktiver Auth und einem jwt-Endpunkt (Literal-Secrets
+    /// nur im Test; produktiv ${ENV}-Indirection).
+    const AUTH_MINIMAL: &str = r#"
+[apps.a]
+  [apps.a.auth]
+  enabled = true
+  jwt_secret = "0123456789abcdef0123456789abcdef"
+
+    [apps.a.endpoints.tasks_get]
+    path = "/tasks"
+    method = "GET"
+
+    [apps.a.endpoints.tasks_post]
+    path = "/tasks"
+    method = "POST"
+    auth_mode = "jwt"
+"#;
+
+    #[test]
+    fn auth_section_parses_with_defaults() {
+        let config = EngineConfig::from_toml(AUTH_MINIMAL).expect("auth config must load");
+        let app = &config.apps["a"];
+        let auth = app.auth.as_ref().expect("auth settings");
+        assert_eq!(auth.access_token_secs, DEFAULT_ACCESS_TOKEN_SECS);
+        assert_eq!(auth.refresh_token_secs, DEFAULT_REFRESH_TOKEN_SECS);
+        assert!(!auth.registration_open);
+        assert!(auth.allowed_origins.is_none());
+        assert!(auth.admin.is_none());
+        assert_eq!(auth.rate_limit.login_per_min, 10);
+        assert_eq!(auth.rate_limit.register_per_min, 5);
+        assert_eq!(auth.rate_limit.refresh_per_min, 30);
+
+        let post = app.endpoints["tasks_post"].clone();
+        assert_eq!(post.auth_mode, AuthMode::Jwt);
+        assert!(post.roles.is_none());
+        let get = app.endpoints["tasks_get"].clone();
+        assert_eq!(get.auth_mode, AuthMode::None);
+    }
+
+    #[test]
+    fn auth_disabled_leaves_apps_untouched() {
+        // enabled = false (oder keine Sektion): Auth bleibt aus, selbst wenn
+        // Restwerte herumstehen — die App verhaelt sich wie vorher.
+        let src = r#"
+[apps.a]
+  [apps.a.auth]
+  enabled = false
+  jwt_secret = "0123456789abcdef0123456789abcdef"
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let config = EngineConfig::from_toml(src).expect("disabled auth must load");
+        assert!(config.apps["a"].auth.is_none());
+        assert_eq!(config.apps["a"].endpoints["one"].auth_mode, AuthMode::None);
+    }
+
+    #[test]
+    fn auth_enabled_without_jwt_secret_is_rejected() {
+        let src = r#"
+[apps.a]
+  [apps.a.auth]
+  enabled = true
+    [apps.a.endpoints.one]
+    path = "/tasks"
+    method = "GET"
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(err.message().contains("jwt_secret"), "{err}");
+    }
+
+    #[test]
+    fn auth_short_jwt_secret_is_rejected() {
+        let src = AUTH_MINIMAL.replace("0123456789abcdef0123456789abcdef", "zu_kurz_1234567890");
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(
+            err.message()
+                .contains(&format!("at least {MIN_JWT_SECRET_LEN} characters")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn auth_jwt_secret_env_indirection() {
+        let src = AUTH_MINIMAL.replace(
+            "jwt_secret = \"0123456789abcdef0123456789abcdef\"",
+            "jwt_secret = \"${TEST_JWT_SECRET}\"",
+        );
+        let file: AppsFile = toml::from_str(&src).unwrap();
+        let lookup = |name: &str| (name == "TEST_JWT_SECRET").then(|| "x".repeat(48).to_string());
+        let config = EngineConfig::validate_with(file, lookup).expect("env must resolve");
+        assert_eq!(
+            config.apps["a"].auth.as_ref().unwrap().jwt_secret.as_ref(),
+            "x".repeat(48)
+        );
+
+        // Fehlende Variable: Fail-Fast mit Variablenname.
+        let file: AppsFile = toml::from_str(&src).unwrap();
+        let lookup = |name: &str| (name == "OTHER").then(|| "y".to_string());
+        let err = EngineConfig::validate_with(file, lookup).unwrap_err();
+        assert!(err.message().contains("TEST_JWT_SECRET"), "{err}");
+    }
+
+    #[test]
+    fn auth_token_lifetimes_are_bounded() {
+        for (field, value) in [
+            ("access_token_secs", "59"),
+            ("access_token_secs", "100000"),
+            ("refresh_token_secs", "3599"),
+            ("refresh_token_secs", "40000000"),
+        ] {
+            let src = AUTH_MINIMAL.replace(
+                "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n",
+                &format!(
+                    "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n  {field} = {value}\n"
+                ),
+            );
+            let err = EngineConfig::from_toml(&src).unwrap_err();
+            assert!(err.message().contains(field), "{field}={value}: {err}");
+        }
+    }
+
+    #[test]
+    fn auth_allowed_origins_reject_wildcard_and_validate() {
+        let src = AUTH_MINIMAL.replace(
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n",
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n  allowed_origins = [\"*\"]\n",
+        );
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("cannot use `*`"), "{err}");
+
+        let src = AUTH_MINIMAL.replace(
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n",
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n  \
+             allowed_origins = [\"https://APP.example.com\", \"https://app.example.com\"]\n",
+        );
+        let config = EngineConfig::from_toml(&src).expect("origins must normalize");
+        assert_eq!(
+            config.apps["a"]
+                .auth
+                .as_ref()
+                .unwrap()
+                .allowed_origins
+                .as_deref(),
+            Some(&["https://app.example.com".to_string()][..]),
+            "Case-Duplikat wird nach Lowercase-Normalisierung dedupliziert"
+        );
+    }
+
+    #[test]
+    fn auth_admin_bootstrap_pairing_and_policy() {
+        // Nur E-Mail ohne Passwort: Fail-Fast.
+        let src = AUTH_MINIMAL.replace(
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n",
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n  \
+             admin_email = \"admin@example.com\"\n",
+        );
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("together"), "{err}");
+
+        // Bootstrap-Passwort, das die eigene Policy verletzt: Fail-Fast.
+        let src = AUTH_MINIMAL.replace(
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n",
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n  \
+             admin_email = \"admin@example.com\"\n  admin_password = \"kurz\"\n",
+        );
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("password policy"), "{err}");
+
+        // Gueltiges Paar (Policy-konform) mit ENV-Indirection.
+        let src = AUTH_MINIMAL.replace(
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n",
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n  \
+             admin_email = \"Admin@Example.com\"\n  admin_password = \"${ADMIN_PW}\"\n",
+        );
+        let file: AppsFile = toml::from_str(&src).unwrap();
+        let lookup =
+            |name: &str| (name == "ADMIN_PW").then(|| "V3ry-Secret_Passphrase!".to_string());
+        let config = EngineConfig::validate_with(file, lookup).expect("admin bootstrap");
+        let admin = config.apps["a"]
+            .auth
+            .as_ref()
+            .unwrap()
+            .admin
+            .clone()
+            .unwrap();
+        assert_eq!(admin.email, "admin@example.com", "E-Mail wird normalisiert");
+        assert_eq!(admin.password, "V3ry-Secret_Passphrase!");
+    }
+
+    #[test]
+    fn password_policy_defaults_and_switches() {
+        let defaults = PasswordPolicy::default();
+        assert!(defaults.check("Abcdef1!xyz").is_ok());
+        // Default-Policy: jede Klasse einzeln entfernen -> genau eine Regel
+        // wird als verletzt gemeldet (Laenge jeweils konform halten).
+        let cases = [
+            ("abcdefg1!x", "uppercase letter"),
+            ("ABCDEFG1!Q", "lowercase letter"),
+            ("Abcdefgh!x", "digit"),
+            ("Abcdefg1Ax", "special character"),
+            ("Ab1!", "characters long"),
+        ];
+        for (password, expected) in cases {
+            let violations = match defaults.check(password) {
+                Err(violations) => violations,
+                Ok(()) => panic!("expected a violation for `{password}`"),
+            };
+            assert_eq!(violations.len(), 1, "{password}: {violations:?}");
+            assert!(
+                violations[0].contains(expected),
+                "{password}: {violations:?}"
+            );
+        }
+
+        // Alles ausgeschaltet: kurzes Passwort ohne Klassen ist ok.
+        let lenient = PasswordPolicy {
+            min_length: 1,
+            max_length: HARD_MAX_PASSWORD_LEN,
+            require_lowercase: false,
+            require_uppercase: false,
+            require_digits: false,
+            require_special: false,
+        };
+        assert!(lenient.check("a").is_ok());
+        assert!(
+            lenient
+                .check(&"x".repeat(HARD_MAX_PASSWORD_LEN + 1))
+                .is_err()
+        );
+
+        // Laengen-Grenzen (chars, nicht Bytes) plus several violations at once.
+        let strict = PasswordPolicy {
+            min_length: 4,
+            ..PasswordPolicy::default()
+        };
+        assert!(
+            strict.check("Aa1!äöü").is_ok(),
+            "Unicode zaehlt als Sonderzeichen"
+        );
+        assert_eq!(
+            strict.check("ab").unwrap_err().len(),
+            4,
+            "Laenge + Gross + Ziffer + Sonderzeichen"
+        );
+    }
+
+    #[test]
+    fn password_policy_config_bounds() {
+        // min > max und max ueber Hard-Cap sind Startfehler.
+        let base = "  password_policy = { min_length = 20, max_length = 10 }\n";
+        let src = AUTH_MINIMAL.replace(
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n",
+            &format!("  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n{base}"),
+        );
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("min_length"), "{err}");
+
+        let base = "  password_policy = { max_length = 5000 }\n";
+        let src = AUTH_MINIMAL.replace(
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n",
+            &format!("  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n{base}"),
+        );
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("hard cap"), "{err}");
+    }
+
+    #[test]
+    fn auth_rate_limit_bounds() {
+        let src = AUTH_MINIMAL.replace(
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n",
+            "  jwt_secret = \"0123456789abcdef0123456789abcdef\"\n  \
+             rate_limit = { login_per_min = 0 }\n",
+        );
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("login_per_min"), "{err}");
+    }
+
+    #[test]
+    fn jwt_mode_without_enabled_auth_is_rejected() {
+        let src = AUTH_MINIMAL.replace("  enabled = true\n", "");
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(
+            err.message().contains("auth_mode") && err.message().contains("[auth]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn auth_mode_and_auth_required_conflict() {
+        let src = AUTH_MINIMAL.replace(
+            "    auth_mode = \"jwt\"",
+            "    auth_mode = \"jwt\"\n    auth_required = true",
+        );
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("cannot be combined"), "{err}");
+
+        // auth_mode = "api_key" + auth_required: doppelt gemoppelt -> Fehler.
+        let src = AUTH_MINIMAL.replace(
+            "    auth_mode = \"jwt\"",
+            "    auth_mode = \"api_key\"\n    auth_required = true",
+        );
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("say the same thing twice"), "{err}");
+    }
+
+    #[test]
+    fn auth_mode_api_key_still_requires_secret() {
+        let src = AUTH_MINIMAL.replace("auth_mode = \"jwt\"", "auth_mode = \"api_key\"");
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("api_key_secret"), "{err}");
+    }
+
+    #[test]
+    fn auth_mode_api_key_parses_like_auth_required() {
+        let src = r#"
+[apps.a]
+api_key_secret = "secret_secret_geheim"
+  [apps.a.endpoints.one]
+  path = "/tasks"
+  method = "POST"
+  auth_mode = "api_key"
+  [apps.a.endpoints.two]
+  path = "/tasks"
+  method = "GET"
+"#;
+        let config = EngineConfig::from_toml(src).unwrap();
+        assert_eq!(
+            config.apps["a"].endpoints["one"].auth_mode,
+            AuthMode::ApiKey
+        );
+        assert_eq!(config.apps["a"].endpoints["two"].auth_mode, AuthMode::None);
+    }
+
+    #[test]
+    fn unknown_auth_mode_is_rejected() {
+        let src = AUTH_MINIMAL.replace("auth_mode = \"jwt\"", "auth_mode = \"oauth\"");
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("unknown auth_mode `oauth`"), "{err}");
+    }
+
+    #[test]
+    fn roles_are_validated_and_normalized() {
+        let src = AUTH_MINIMAL.replace(
+            "    auth_mode = \"jwt\"",
+            "    auth_mode = \"jwt\"\n    roles = [\"admin\", \"User-1\", \"admin\"]",
+        );
+        let config = EngineConfig::from_toml(&src).expect("roles must load");
+        let roles = config.apps["a"].endpoints["tasks_post"]
+            .roles
+            .clone()
+            .unwrap();
+        assert_eq!(roles.as_ref(), ["User-1", "admin"]);
+
+        let bad = AUTH_MINIMAL.replace(
+            "    auth_mode = \"jwt\"",
+            "    auth_mode = \"jwt\"\n    roles = [\"bad role!\"]",
+        );
+        let err = EngineConfig::from_toml(&bad).unwrap_err();
+        assert!(err.message().contains("invalid role"), "{err}");
+
+        let empty = AUTH_MINIMAL.replace(
+            "    auth_mode = \"jwt\"",
+            "    auth_mode = \"jwt\"\n    roles = []",
+        );
+        let err = EngineConfig::from_toml(&empty).unwrap_err();
+        assert!(err.message().contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn roles_without_jwt_mode_are_rejected() {
+        let src = r#"
+[apps.a]
+api_key_secret = "secret_secret_geheim"
+  [apps.a.endpoints.one]
+  path = "/tasks"
+  method = "POST"
+  auth_required = true
+  roles = ["admin"]
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(err.message().contains("roles require"), "{err}");
+    }
+
+    #[test]
+    fn auth_path_is_reserved_when_auth_enabled() {
+        let src = AUTH_MINIMAL.replace("path = \"/tasks\"", "path = \"/_auth\"");
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(err.message().contains("reserved"), "{err}");
+
+        // Ohne aktivierte Auth bleibt /_auth eine ganz normale Kollektion.
+        let src = r#"
+[apps.a]
+  [apps.a.auth]
+  enabled = false
+  jwt_secret = "0123456789abcdef0123456789abcdef"
+    [apps.a.endpoints.one]
+    path = "/_auth"
+    method = "GET"
+"#;
+        let config = EngineConfig::from_toml(src).expect("/_auth ohne Auth ist erlaubt");
+        assert_eq!(config.apps["a"].endpoints["one"].path, "/_auth");
+    }
+
+    #[test]
+    fn auth_section_typos_fail_fast() {
+        let src =
+            AUTH_MINIMAL.replace("  enabled = true\n", "  enabled = true\n  sekret = \"x\"\n");
+        let err = EngineConfig::from_toml(&src).unwrap_err();
+        assert!(matches!(err, EngineError::Config(_)));
     }
 }
