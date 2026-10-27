@@ -76,10 +76,16 @@ documents in RAM:
 | Plain list `?limit=20` (fast path) | **49,613** | 610 µs | 1.40 ms |
 | Indexed equality filter `?grp=g2` | **32,391** | 949 µs | 1.95 ms |
 | POST (scripted, no persistence) | **48,314** | 615 µs | 1.61 ms |
-| POST with WAL persistence enabled | ~21,800 | — | ~2.8 ms |
+| POST with WAL persistence enabled | ~21,800¹ | — | ~2.8 ms |
 | Range scan over 5,000 docs | 6,894 | 4.46 ms | 9.87 ms |
 | Full sort | 6,452 | 4.70 ms | 10.71 ms |
 | Index prefilter + range + sort | 13,905 | 2.20 ms | 5.03 ms |
+
+¹ Older run on a slower disk. The same measurement on today's NVMe host (2026-10-27,
+  JWT POST with `--data-dir`) reaches **37,923 RPS** (p50 0.80 ms), only ~7 % below the
+  RAM-only baseline. The WAL worker batches writes (`write()` per batch, `fsync()` only on
+  rotation/shutdown): durable against process crashes; power-loss durability is bounded by
+  the snapshot interval — the classic `synchronous = NORMAL` trade-off.
 
 Store-level microbenchmarks (`bench_tiering`, 200k docs, hot cap 50k):
 
@@ -102,6 +108,7 @@ build, loopback, 32 keep-alive connections — reproduce as documented in the fi
 | Indexed equality filter, no auth | 40,850 | 0.73 ms | 1.9 ms |
 | Indexed equality filter + JWT | 43,323 | 0.69 ms | 1.7 ms |
 | POST (RAM-only) + JWT | 40,741 | 0.74 ms | 1.8 ms |
+| POST (WAL persistence) + JWT | 37,923 | 0.80 ms | 1.9 ms |
 | Single login (Argon2id verify + token issue) | — | ~28 ms | — |
 
 Reading these honestly: JWT verification plus the fresh per-request user lookup costs

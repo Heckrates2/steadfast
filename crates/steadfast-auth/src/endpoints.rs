@@ -1156,7 +1156,19 @@ mod tests {
 
     #[tokio::test]
     async fn lockout_after_threshold_failed_logins() {
-        let auth = test_app_auth();
+        // Login-Limit hochdrehen: Der Test benoetigt LOCKOUT_THRESHOLD+1
+        // Versuche ueber dieselbe IP — mit dem Default (10/min) wuerde je
+        // nach Argon2-Laufzeit der 11. Request am Rate-Limiter (429)
+        // statt am Lockout scheitern. Hier soll isoliert der Lockout
+        // greifen; das Zusammenspiel beider Grenzen testet
+        // login_rate_limit_returns_429_with_retry_after.
+        let auth = crate::AppAuth::init(
+            "demo",
+            settings_with(|s| s.rate_limit.login_per_min = 1000),
+            std::sync::Arc::new(steadfast_storage::MemoryStore::new()),
+            None,
+        )
+        .unwrap();
         registered(&auth).await;
         let wrong = r#"{"email":"u@example.com","password":"falsch-1234"}"#;
         for _ in 0..crate::LOGIN_FAILURE_THRESHOLD {
@@ -1174,6 +1186,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
         assert_eq!(body["error"]["code"], json!("invalid_credentials"));
+
+        // Und der gesperrte Account bleibt auch nach weiteren Versuchen
+        // bei 401 (kein Reset durch Rate-Limit-Drehen o. ae.).
+        let (status, _, _) = call(&auth, "POST", "login", Some(wrong), &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

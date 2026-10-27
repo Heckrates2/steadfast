@@ -74,10 +74,17 @@ aufnimmt, keine Deployment-Zahl. Release-Build, 32 Keep-Alive-Verbindungen, 5.00
 | Einfache Liste `?limit=20` (Fast Path) | **49.613** | 610 µs | 1,40 ms |
 | Indizierter Gleichheitsfilter `?grp=g2` | **32.391** | 949 µs | 1,95 ms |
 | POST (geskriptet, ohne Persistenz) | **48.314** | 615 µs | 1,61 ms |
-| POST mit aktivierter WAL-Persistenz | ~21.800 | — | ~2,8 ms |
+| POST mit aktivierter WAL-Persistenz | ~21.800¹ | — | ~2,8 ms |
 | Range-Scan über 5.000 Docs | 6.894 | 4,46 ms | 9,87 ms |
 | Vollständige Sortierung | 6.452 | 4,70 ms | 10,71 ms |
 | Index-Präfilter + Range + Sortierung | 13.905 | 2,20 ms | 5,03 ms |
+
+¹ Älterer Lauf auf langsamerer Platte. Dieselbe Messung auf dem heutigen NVMe-Host
+  (2026-10-27, JWT-POST mit `--data-dir`) erreicht **37.923 RPS** (p50 0,80 ms), nur ~7 %
+  unter der RAM-only-Baseline. Der WAL-Worker batcht Schreibzugriffe (`write()` pro Batch,
+  `fsync()` erst bei Rotation/Shutdown): dauerhaft gegen Prozess-Crashes; Power-Loss-
+  Dauerhaftigkeit ist durch das Snapshot-Intervall begrenzt — der klassische
+  `synchronous = NORMAL`-Kompromiss.
 
 Store-Microbenchmarks (`bench_tiering`, 200k Docs, Hot-Cap 50k):
 
@@ -100,6 +107,7 @@ Release-Build, Loopback, 32 Keep-Alive-Verbindungen — Reproduktion wie in der 
 | Indizierter Gleichheitsfilter ohne Auth | 40.850 | 0,73 ms | 1,9 ms |
 | Indizierter Gleichheitsfilter mit JWT | 43.323 | 0,69 ms | 1,7 ms |
 | POST (RAM-only) mit JWT | 40.741 | 0,74 ms | 1,8 ms |
+| POST (WAL-Persistenz) mit JWT | 37.923 | 0,80 ms | 1,9 ms |
 | Einzelner Login (Argon2id + Token-Ausstellung) | — | ~28 ms | — |
 
 Ehrlich gelesen: Die JWT-Verifizierung plus der frische Benutzer-Lookup pro Request kosten
