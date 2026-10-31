@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use steadfast_core::{
     AuthMode, EndpointRuntime, EngineError, HttpMethod, MAX_PAGE_SIZE, ScriptRuntime,
 };
-use steadfast_storage::{ListParams, ListResult, PatchOutcome, RangeOp, SortSpec};
+use steadfast_storage::{
+    BulkPatchOutcome, BulkPatchReport, ListParams, ListResult, PatchOutcome, RangeOp, SortSpec,
+};
 use uuid::Uuid;
 
 use crate::auth::{
@@ -255,6 +257,12 @@ pub async fn handle(
         (HttpMethod::Put, None) => bad_request("PUT requires an item id: /{app}/{collection}/{id}"),
         (HttpMethod::Patch, Some(id)) => {
             patch_merge(&state, endpoint, &app_id, collection, id, body, user)
+        }
+        // `bulk = true`: PATCH auf der Kollektion (ohne Item-ID) ist der
+        // atomare Sammel-Patch. Der Single-Doc-Patch desselben Endpunkts
+        // (mit Item-ID) bleibt unveraendert.
+        (HttpMethod::Patch, None) if endpoint.bulk => {
+            patch_bulk(&state, endpoint, &app_id, collection, body, user)
         }
         (HttpMethod::Patch, None) => {
             bad_request("PATCH requires an item id: /{app}/{collection}/{id}")
@@ -701,6 +709,174 @@ fn merge_shallow(mut base: Value, patch: Value) -> Value {
     base
 }
 
+// --- PATCH (Sammel-Patch, bulk = true) ----------------------------------------
+
+/// Atomarer Sammel-Patch auf der Kollektion: `{"filter": {...}, "set": {...}}`
+/// wendet `set` auf alle Dokumente an, die `filter` erfuellen — in EINEM
+/// Request, unter EINEM Schreib-Mutex, all-or-nothing. Der Filter folgt
+/// exakt der GET-Semantik (Gleichheit + `_min/_max/_gt/_lt`-Bereiche,
+/// Allowlist, DoS-Grenzen); `set` wird wie beim Single-PATCH nur
+/// typmaessig validiert (partial, keine required-Pflicht). Die Antwort
+/// zaehlt `matched` (Treffer zum Commit-Zeitpunkt) und `patched`
+/// (tatsaechlich neu geschrieben; No-ops werden uebersprungen).
+fn patch_bulk(
+    state: &AppState,
+    endpoint: &EndpointRuntime,
+    app_id: &str,
+    collection: &str,
+    body: Bytes,
+    user: Value,
+) -> Response {
+    let body = match parse_json_object(&body) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    // Genau zwei Schluessel: `filter` und `set` — alles andere (Tippfehler
+    // wie `filters`, verschachtelte Payloads) ist eine 400, bevor irgendwas
+    // gelesen wird.
+    let mut filter: Option<Value> = None;
+    let mut set: Option<Value> = None;
+    let shape_hint = "bulk patch body must be a JSON object with exactly \
+                      {\"filter\": {...}, \"set\": {...}}";
+    let Value::Object(body_map) = body else {
+        return bad_request("request body must be a JSON object");
+    };
+    for (key, value) in body_map {
+        match key.as_str() {
+            "filter" => filter = Some(value),
+            "set" => set = Some(value),
+            _ => return bad_request(shape_hint),
+        }
+    }
+    let (Some(Value::Object(filter)), Some(Value::Object(set))) = (filter, set) else {
+        return bad_request(shape_hint);
+    };
+    if filter.is_empty() {
+        // Verwechslungsschutz: "alle Dokumente" gibt es nur mit explizitem
+        // Filter, niemals als implizites Default.
+        return bad_request(
+            "bulk patch requires a non-empty `filter` object — \
+             an empty filter would match every document",
+        );
+    }
+    if set.is_empty() {
+        return bad_request("bulk patch requires a non-empty `set` object");
+    }
+
+    // Filter-Objekt -> Gleichheits-/Bereichsfilter mit denselben Regeln wie
+    // der Query-String von GET (Feldnamen, Allowlist, Grenzen, Rohwerte).
+    let (filters, ranges) = match parse_bulk_filter(&filter, endpoint.filter_fields.as_deref()) {
+        Ok(parsed) => parsed,
+        Err(message) => return bad_request(&message),
+    };
+
+    // `set` wird doc-unabhaengig geprueft (partial = true, wie beim Single-
+    // PATCH: fehlende required-Felder kommen aus dem Bestand, Typ- und
+    // Unknown-Field-Regeln gelten). Das laeuft VOR dem Schreib-Mutex und
+    // VOR der ersten Transformation — ein typfremdes `set` veraendert nie
+    // ein einziges Dokument.
+    let set = Value::Object(set);
+    if let Some(schema) = &endpoint.schema {
+        if let Err(details) = schema.validate(&set, true) {
+            return validation_failed_response(&details);
+        }
+    }
+
+    // Merge + Skript laufen pro Treffer IM Store unter dem per-Kollektion-
+    // Schreib-Mutex (dieselbe Invariante wie beim Single-PATCH). Ein
+    // Skript-`throw` fuer IRGENDEIN Treffer bricht ab, bevor der erste
+    // Commit passiert — der Bestand bleibt vollstaendig unveraendert.
+    let outcome =
+        state
+            .store()
+            .patch_merge_bulk(app_id, collection, &filters, &ranges, |current| {
+                let merged = merge_shallow(current, set.clone());
+                run_script(endpoint, merged, user.clone())
+            });
+    match outcome {
+        BulkPatchOutcome::Completed(BulkPatchReport { matched, patched }) => json_response(
+            StatusCode::OK,
+            &json!({ "matched": matched, "patched": patched }),
+        ),
+        BulkPatchOutcome::Rejected(response) => *response,
+    }
+}
+
+/// Filterergebnis des Sammel-Patch-Koerpers: Gleichheits- und Bereichsfilter
+/// in genau der Form, die `MemoryStore::patch_merge_bulk` erwartet
+/// (identisch zum Filteranteil von `ListParams`).
+type ParsedBulkFilter = (Vec<(String, String)>, Vec<(String, RangeOp, String)>);
+
+/// JSON-`filter`-Objekt -> `(filters, ranges)` mit GET-Semantik: Feldnamen
+/// muessen `is_valid_query_field` bestehen, Suffixe `_min/_max/_gt/_lt`
+/// machen den Key zum Bereichsfilter (Basisname bleibt Allowlist-Massstab),
+/// Werte werden als reine Vergleichs-Rohwerte uebersetzt (String bleibt,
+/// Bool -> "true"/"false", Zahl -> kanonischer Text; Objekte/Arrays/null
+/// matchen nie und werden mit 400 abgelehnt, statt still leer zu laufen).
+/// DoS-Grenzen (`MAX_FILTERS`, `MAX_FILTER_VALUE_LEN`) und die optionale
+/// Allowlist entsprechen `parse_list_query`.
+fn parse_bulk_filter(
+    filter: &serde_json::Map<String, Value>,
+    allowed: Option<&[String]>,
+) -> Result<ParsedBulkFilter, String> {
+    if filter.len() > MAX_FILTERS {
+        return Err(format!("too many filter fields (max {MAX_FILTERS})"));
+    }
+    let mut filters: Vec<(String, String)> = Vec::new();
+    let mut ranges: Vec<(String, RangeOp, String)> = Vec::new();
+    for (key, value) in filter {
+        let raw = match value {
+            Value::String(s) => s.clone(),
+            Value::Bool(true) => "true".to_string(),
+            Value::Bool(false) => "false".to_string(),
+            // Zahl: serde_json liefert den kanonischen Text (i64/u64/f64),
+            // den auch `value_matches`/`value_in_range` zurueckparsen.
+            Value::Number(number) => number.to_string(),
+            Value::Object(_) | Value::Array(_) | Value::Null => {
+                return Err(format!(
+                    "filter value for `{key}` must be a string, number, or boolean"
+                ));
+            }
+        };
+        let range = RANGE_SUFFIXES.iter().find_map(|(suffix, op)| {
+            key.strip_suffix(suffix)
+                .filter(|base| is_valid_query_field(base))
+                .map(|base| (*op, base.to_string()))
+        });
+        if let Some((op, base)) = range {
+            if raw.len() > MAX_FILTER_VALUE_LEN {
+                return Err("range bound too long (max 256 bytes)".to_string());
+            }
+            ranges.push((base, op, raw));
+        } else {
+            if !is_valid_query_field(key) {
+                return Err(format!("invalid filter field `{key}`"));
+            }
+            if raw.len() > MAX_FILTER_VALUE_LEN {
+                return Err("filter value too long (max 256 bytes)".to_string());
+            }
+            filters.push((key.clone(), raw));
+        }
+    }
+    if let Some(allowed) = allowed {
+        for (key, _) in &filters {
+            if !allowed.iter().any(|field| field == key) {
+                return Err(format!(
+                    "filtering on `{key}` is not allowed for this endpoint"
+                ));
+            }
+        }
+        for (base, _, _) in &ranges {
+            if !allowed.iter().any(|field| field == base) {
+                return Err(format!(
+                    "filtering on `{base}` is not allowed for this endpoint"
+                ));
+            }
+        }
+    }
+    Ok((filters, ranges))
+}
+
 // --- DELETE -------------------------------------------------------------------
 
 fn delete_item(state: &AppState, app_id: &str, collection: &str, id: &str) -> Response {
@@ -829,6 +1005,7 @@ mod tests {
 
     const TODO_SECRET: &str = "super_geheimes_todo_salt_123";
     const GALLERY_SECRET: &str = "gallery_secret_456";
+    const LEDGER_SECRET: &str = "ledger_secret_789";
 
     const TEST_TOML: &str = r#"
 [apps.todo_app]
@@ -986,6 +1163,70 @@ api_key_secret = "gallery_secret_456"
   [apps.minimal_app.endpoints.only_get]
   path = "/only"
   method = "GET"
+
+[apps.ledger_app]
+api_key_secret = "ledger_secret_789"
+
+  [apps.ledger_app.endpoints.ledger_get]
+  path = "/ledger"
+  method = "GET"
+  auth_required = true
+  filter_fields = ["person", "paid"]
+
+  [apps.ledger_app.endpoints.ledger_create]
+  path = "/ledger"
+  method = "POST"
+  auth_required = true
+
+    [apps.ledger_app.endpoints.ledger_create.schema]
+    required = ["person"]
+    allow_unknown_fields = false
+
+      [apps.ledger_app.endpoints.ledger_create.schema.types]
+      person = "string"
+      amount = "number"
+      paid = "boolean"
+
+  [apps.ledger_app.endpoints.ledger_patch]
+  path = "/ledger"
+  method = "PATCH"
+  auth_required = true
+  bulk = true
+  filter_fields = ["person", "paid"]
+
+    [apps.ledger_app.endpoints.ledger_patch.schema]
+    allow_unknown_fields = false
+
+      [apps.ledger_app.endpoints.ledger_patch.schema.types]
+      person = "string"
+      amount = "number"
+      paid = "boolean"
+
+[apps.script_app]
+
+  [apps.script_app.endpoints.items_get]
+  path = "/items"
+  method = "GET"
+
+  [apps.script_app.endpoints.items_create]
+  path = "/items"
+  method = "POST"
+
+  [apps.script_app.endpoints.items_bulk_patch]
+  path = "/items"
+  method = "PATCH"
+  bulk = true
+  filter_fields = ["kind"]
+
+  business_logic = """
+  fn on_request(payload, user) {
+      if payload.name == "boom" {
+          throw "Sammel-Patch abgebrochen";
+      }
+      payload.touched = true;
+      return payload;
+  }
+  """
 "#;
 
     fn app() -> axum::Router {
@@ -2118,6 +2359,366 @@ api_key_secret = "gallery_secret_456"
         assert!(bytes.is_empty(), "HEAD must not send a body");
     }
 
+    // --- Sammel-Patch (bulk = true) -------------------------------------------------
+
+    fn ledger_headers() -> Vec<(&'static str, String)> {
+        vec![("x-api-key", LEDGER_SECRET.to_string())]
+    }
+
+    async fn seed_ledger(router: &axum::Router, docs: &[Value]) {
+        for doc in docs {
+            let response = send(
+                router.clone(),
+                req_json("POST", "/ledger_app/ledger", &ledger_headers(), doc),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+    }
+
+    async fn ledger_ids(router: &axum::Router, query: &str) -> Vec<String> {
+        let response = send(
+            router.clone(),
+            req_auth(
+                "GET",
+                &format!("/ledger_app/ledger{query}"),
+                &ledger_headers(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let list = body_json(response).await;
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|doc| doc["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_updates_all_matching_documents_over_http() {
+        let router = app();
+        seed_ledger(
+            &router,
+            &[
+                json!({"person": "ann", "paid": true}),
+                json!({"person": "ann", "paid": true}),
+                json!({"person": "bob", "paid": true}),
+                json!({"person": "bob", "paid": false}),
+            ],
+        )
+        .await;
+
+        // Ein Request statt mehrerer einzelner PATCHes: alle bezahlten
+        // Dokumente in einem Zug auf `paid = false`.
+        let body = json!({"filter": {"paid": true}, "set": {"paid": false}});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/ledger_app/ledger", &ledger_headers(), &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report = body_json(response).await;
+        assert_eq!(report["matched"], 3);
+        assert_eq!(report["patched"], 3);
+
+        // Der Sekundaerindex stimmt hinterher exakt (der GET-Fastpath liest
+        // ihn ohne Nachpruefung — Geistereintraege waeren hier sichtbar).
+        assert!(ledger_ids(&router, "?paid=true").await.is_empty());
+        assert_eq!(ledger_ids(&router, "?paid=false").await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_filter_selects_subset_and_counts_noops() {
+        let router = app();
+        seed_ledger(
+            &router,
+            &[
+                json!({"person": "ann", "paid": true}),
+                json!({"person": "bob", "paid": true}),
+                json!({"person": "ann", "paid": false}),
+            ],
+        )
+        .await;
+
+        let body = json!({"filter": {"person": "ann"}, "set": {"paid": false}});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/ledger_app/ledger", &ledger_headers(), &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report = body_json(response).await;
+        // Nur die ann-Dokumente sind Treffer; das dritte erfuellt den Filter,
+        // ist durch das `set` aber bereits im Zielzustand — `matched` zaehlt
+        // es, `patched` nicht (kein Commit, kein WAL-Op).
+        assert_eq!(report["matched"], 2);
+        assert_eq!(report["patched"], 1);
+        assert_eq!(ledger_ids(&router, "?paid=true").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_schema_violation_changes_nothing() {
+        let router = app();
+        seed_ledger(
+            &router,
+            &[
+                json!({"person": "ann", "paid": true}),
+                json!({"person": "bob", "paid": true}),
+            ],
+        )
+        .await;
+
+        // Typverletzung im `set`: 400, und kein einziges Dokument aendert
+        // sich — die Pruefung laeuft vor dem Schreib-Mutex.
+        let body = json!({"filter": {"paid": true}, "set": {"paid": "yes"}});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/ledger_app/ledger", &ledger_headers(), &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(response).await;
+        assert_eq!(err["error"]["code"], "validation_failed");
+        assert_eq!(ledger_ids(&router, "?paid=true").await.len(), 2);
+
+        // Unbekanntes Feld im `set` (allow_unknown_fields = false): dieselbe
+        // Garantie.
+        let body = json!({"filter": {"paid": true}, "set": {"memo": "x"}});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/ledger_app/ledger", &ledger_headers(), &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(ledger_ids(&router, "?paid=true").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_rejects_filter_fields_outside_the_allowlist() {
+        let router = app();
+        seed_ledger(&router, &[json!({"person": "ann", "paid": true})]).await;
+
+        // `amount` steht nicht in filter_fields — der Sammel-Patch teilt die
+        // Allowlist mit GET.
+        let body = json!({"filter": {"amount": 10}, "set": {"paid": false}});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/ledger_app/ledger", &ledger_headers(), &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(response).await;
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("filtering on `amount` is not allowed")
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_rejects_invalid_body_shapes() {
+        let router = app();
+        let cases: Vec<(Value, &str)> = vec![
+            (json!({"set": {"paid": false}}), "filter fehlt"),
+            (json!({"filter": {}, "set": {"paid": false}}), "filter leer"),
+            (json!({"filter": {"paid": true}}), "set fehlt"),
+            (json!({"filter": {"paid": true}, "set": {}}), "set leer"),
+            (
+                json!({"filter": {"paid": true}, "set": {"paid": false}, "where": {}}),
+                "zusaetzlicher Schluessel",
+            ),
+            (
+                json!({"filter": {"paid": {}}, "set": {"paid": false}}),
+                "Filter-Wert ist ein Objekt",
+            ),
+            (json!([1, 2, 3]), "Koerper ist kein Objekt"),
+        ];
+        for (body, what) in cases {
+            let response = send(
+                router.clone(),
+                req_json("PATCH", "/ledger_app/ledger", &ledger_headers(), &body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_requires_the_same_authentication_as_crud() {
+        let router = app();
+        let body = json!({"filter": {"paid": true}, "set": {"paid": false}});
+
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/ledger_app/ledger", &[], &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = vec![("x-api-key", "wrong_key".to_string())];
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/ledger_app/ledger", &wrong, &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn single_doc_patch_still_works_on_a_bulk_endpoint() {
+        let router = app();
+        seed_ledger(
+            &router,
+            &[
+                json!({"person": "ann", "paid": true}),
+                json!({"person": "bob", "paid": true}),
+            ],
+        )
+        .await;
+        let ids = ledger_ids(&router, "?person=ann").await;
+        let id = ids[0].clone();
+
+        // Mit Item-ID greift der gewohnte Single-PATCH desselben Endpunkts —
+        // `bulk = true` aendert nur die id-lose Kollektionsform.
+        let response = send(
+            router.clone(),
+            req_json(
+                "PATCH",
+                &format!("/ledger_app/ledger/{id}"),
+                &ledger_headers(),
+                &json!({"amount": 99}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let doc = body_json(response).await;
+        assert_eq!(doc["amount"], 99);
+        assert_eq!(doc["paid"], true);
+
+        // Und der Sammel-Patch sieht die geaenderten Daten: 1 Treffer,
+        // 1 Commit (die 99 bleibt beim Merge erhalten).
+        let body = json!({"filter": {"person": "ann"}, "set": {"paid": false}});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/ledger_app/ledger", &ledger_headers(), &body),
+        )
+        .await;
+        let report = body_json(response).await;
+        assert_eq!(report["matched"], 1);
+        assert_eq!(report["patched"], 1);
+        assert_eq!(ledger_ids(&router, "?paid=true").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collection_patch_without_bulk_flag_stays_rejected() {
+        // tasks_patch hat kein bulk = true: der Kollektions-PATCH bleibt die
+        // gewohnte 400 ("Item-ID erforderlich") — kein Breaking Change fuer
+        // bestehende Konfigurationen.
+        let response = send(
+            app(),
+            req_json(
+                "PATCH",
+                "/todo_app/tasks",
+                &auth_headers("premium"),
+                &json!({"title": "x"}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(response).await;
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("item id")
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_runs_the_script_per_document() {
+        let router = app();
+        for name in ["ok_1", "ok_2"] {
+            let response = send(
+                router.clone(),
+                req_json(
+                    "POST",
+                    "/script_app/items",
+                    &[],
+                    &json!({"kind": "item", "name": name}),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let body = json!({"filter": {"kind": "item"}, "set": {"note": "x"}});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/script_app/items", &[], &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report = body_json(response).await;
+        assert_eq!(report["matched"], 2);
+        assert_eq!(report["patched"], 2);
+
+        // Das Skript hat je Dokument `touched` gesetzt, der Merge `note`.
+        let response = send(router.clone(), req("GET", "/script_app/items")).await;
+        let list = body_json(response).await;
+        for doc in list["items"].as_array().unwrap() {
+            assert_eq!(doc["touched"], true);
+            assert_eq!(doc["note"], "x");
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_script_rejection_commits_nothing() {
+        let router = app();
+        for name in ["ok_1", "ok_2", "boom"] {
+            let response = send(
+                router.clone(),
+                req_json(
+                    "POST",
+                    "/script_app/items",
+                    &[],
+                    &json!({"kind": "item", "name": name}),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        // Der Skript-`throw` fuer IRGENDEIN Treffer bricht den ganzen
+        // Sammel-Patch ab — auch die beiden an sich passierenden Dokumente
+        // bleiben unveraendert (weder `note` noch `touched`).
+        let body = json!({"filter": {"kind": "item"}, "set": {"note": "x"}});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/script_app/items", &[], &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let err = body_json(response).await;
+        assert_eq!(err["error"]["code"], "script_rejected");
+        assert!(
+            err["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Sammel-Patch abgebrochen")
+        );
+
+        let response = send(router.clone(), req("GET", "/script_app/items")).await;
+        let list = body_json(response).await;
+        assert_eq!(list["total"], 3);
+        for doc in list["items"].as_array().unwrap() {
+            assert!(doc.get("note").is_none());
+            assert!(doc.get("touched").is_none());
+        }
+    }
+
     // --- App-Auth: /_auth-Dispatch und auth_mode = "jwt" ------------------------
 
     const AUTH_TEST_TOML: &str = r#"
@@ -2150,6 +2751,13 @@ api_key_secret = "auth_app_secret_123_geheim"
       return payload;
   }
   """
+
+  [apps.auth_app.endpoints.notes_patch_bulk]
+  path = "/notes"
+  method = "PATCH"
+  auth_mode = "jwt"
+  bulk = true
+  filter_fields = ["done"]
 
   [apps.auth_app.endpoints.audit_get]
   path = "/audit"
@@ -2441,5 +3049,52 @@ api_key_secret = "auth_app_secret_123_geheim"
         // unkonfigurierte) Kollektion -> 404, kein Auth-Dispatch.
         let response = send(app(), req("POST", "/minimal_app/_auth/login")).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn bulk_patch_inherits_jwt_auth_exactly_like_crud() {
+        let router = auth_router();
+        let token = login_token(&router, "auth_app", "admin@auth.app", "Admin-Passw0rt!").await;
+
+        for title in ["notiz a", "notiz b"] {
+            let response = send(
+                router.clone(),
+                req_json(
+                    "POST",
+                    "/auth_app/notes",
+                    &bearer(&token),
+                    &json!({"title": title, "done": true}),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        // Ohne Token: 401, ganz wie beim Single-CRUD.
+        let body = json!({"filter": {"done": true}, "set": {"done": false}});
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/auth_app/notes", &[], &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Mit Token: derselbe Request laeuft durch.
+        let response = send(
+            router.clone(),
+            req_json("PATCH", "/auth_app/notes", &bearer(&token), &body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report = body_json(response).await;
+        assert_eq!(report["matched"], 2);
+        assert_eq!(report["patched"], 2);
+
+        let response = send(router.clone(), req("GET", "/auth_app/notes")).await;
+        let list = body_json(response).await;
+        assert_eq!(list["total"], 2);
+        for doc in list["items"].as_array().unwrap() {
+            assert_eq!(doc["done"], false);
+        }
     }
 }

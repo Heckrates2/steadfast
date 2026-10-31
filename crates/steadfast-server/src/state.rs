@@ -111,10 +111,11 @@ impl AppState {
         let mut auth: HashMap<String, Arc<AppAuth>> = HashMap::new();
         for (app_id, app) in config.apps {
             let mut paths: HashMap<String, PathRoutes> = HashMap::new();
-            // Union der filter_fields aller GET-Endpunkte je Pfad: Genau diese
-            // Felder bekommt die Kollektion als Sekundaerindizes deklariert —
-            // der Server kennt das Filterprofil der Konfiguration und der
-            // Store kann gefilterte Listen damit selektiv beantworten.
+            // Union der filter_fields aller GET- und Bulk-PATCH-Endpunkte je
+            // Pfad: Genau diese Felder bekommt die Kollektion als Sekundaer-
+            // indizes deklariert — der Server kennt das Filterprofil der
+            // Konfiguration, der Store kann gefilterte Listen und Sammel-
+            // Patches damit selektiv beantworten.
             let mut filter_fields: BTreeMap<String, std::collections::BTreeSet<String>> =
                 BTreeMap::new();
             let mut unauthenticated_writes: Vec<String> = Vec::new();
@@ -122,6 +123,8 @@ impl AppState {
                 // M6: Ein schreibender Endpoint ganz ohne Auth ist die
                 // haeufigste Fehlkonfiguration (Default ist none) — beim
                 // Start laut sichtbar machen, statt sie still zu erlauben.
+                // Gilt fuer den Sammel-Patch erst recht (ein Request, viele
+                // Dokumente).
                 if endpoint.method != HttpMethod::Get && endpoint.auth_mode == AuthMode::None {
                     unauthenticated_writes.push(format!(
                         "{} {}",
@@ -129,7 +132,7 @@ impl AppState {
                         endpoint.path
                     ));
                 }
-                if endpoint.method == HttpMethod::Get {
+                if endpoint.method == HttpMethod::Get || endpoint.bulk {
                     if let Some(fields) = &endpoint.filter_fields {
                         filter_fields
                             .entry(endpoint.path.trim_start_matches('/').to_string())

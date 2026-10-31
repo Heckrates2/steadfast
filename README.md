@@ -259,6 +259,7 @@ TLS and edge rate limiting belong).
 | `endpoints.<name>.roles` | Endpoint | Optional role allowlist (only with `auth_mode = "jwt"`): the user's *current* role must match, else 403. Absent = every authenticated user of the app |
 | `endpoints.<name>.paging_default` | Endpoint | Default page size for list GETs (1..=100, default 20) |
 | `endpoints.<name>.filter_fields` | Endpoint | Optional allowlist of filterable/sortable fields — security allowlist **and** index switch |
+| `endpoints.<name>.bulk` | Endpoint | `true` on a `PATCH` endpoint: the id-less form `PATCH /<app>/<coll>` becomes the atomic collection bulk-patch (`{"filter": {...}, "set": {...}}` → `200 {"matched": n, "patched": m}`); `PATCH /<app>/<coll>/{id}` stays the ordinary single merge. Rejected at startup on any non-PATCH method — see [Collection bulk-PATCH](#collection-bulk-patch-bulk--true) |
 | `endpoints.<name>.business_logic` | Endpoint | Rhai script with hook `fn on_request(payload, user)`; runs before storage on POST/PUT/PATCH; `throw` → 422 |
 | `endpoints.<name>.schema` | Endpoint | Optional validation for POST/PUT/PATCH. `required = [...]` (enforced on POST/PUT; PATCH is partial), `allow_unknown_fields` (default `false` — reject undeclared fields), `schema.types.<field> = "string" \| "number" \| "boolean" \| "object" \| "array" \| "null" \| "date" (strict `YYYY-MM-DD`, leap years included) \| "datetime" (RFC 3339 — timezone `Z`/`±HH:MM` required). Invalid type strings or field names abort startup |
 
@@ -292,6 +293,9 @@ can read it.
 * `PUT /<app>/<coll>/{id}` — full replace, `id` forced from path.
 * `PATCH /<app>/<coll>/{id}` — shallow merge + script, atomic under the collection's write
   lock (no lost updates; a script `throw` commits nothing).
+* `PATCH /<app>/<coll>` — with `bulk = true`: the atomic collection bulk-patch (see
+  [below](#collection-bulk-patch-bulk--true)); without the flag this stays a
+  400 "requires an item id".
 * `DELETE /<app>/<coll>/{id}` — `204`.
 
 List queries: reserved params are `page`, `limit`, `sort`, `order`. `field=value` is an
@@ -310,6 +314,72 @@ rejection · 500 sandbox limits (generic message, details in the log).
 User metadata for scripts comes from `X-User-Id` / `X-User-Role` (defaults `anonymous` /
 `user`). Set `ENGINE_GATEWAY_SECRET` and these headers only count when the request proves
 gateway provenance via `X-Internal-Auth` — direct clients cannot spoof roles.
+
+### Collection bulk-PATCH (`bulk = true`)
+
+Setting `bulk = true` on a `PATCH` endpoint activates the atomic collection-level PATCH —
+one request that rewrites every matching document (the "reset the month" operation that
+would otherwise be a chain of individual PATCHes that can tear in half on a flaky link):
+
+```toml
+[apps.ledger.endpoints.ledger_patch]
+path = "/ledger"
+method = "PATCH"
+auth_mode = "jwt"
+bulk = true              # PATCH /ledger        -> bulk patch
+filter_fields = ["person", "paid"]
+
+  [apps.ledger.endpoints.ledger_patch.schema]
+  allow_unknown_fields = false
+
+    [apps.ledger.endpoints.ledger_patch.schema.types]
+    person = "string"
+    paid = "boolean"
+```
+
+```bash
+curl -X PATCH https://host/myapp/ledger \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"filter": {"paid": true}, "set": {"paid": false}}'
+# -> 200 {"matched": 14, "patched": 14}
+```
+
+**Design decision — one flag, not a second route**: `bulk = true` extends the existing
+PATCH endpoint instead of adding a parallel bulk route (e.g. `POST /coll/_bulk`). The
+engine's routing invariant is already one endpoint per `(path, method)`, and the same
+endpoint serves both forms: with an item id the request is the ordinary single-document
+merge, without an id it is the bulk patch. Existing configs keep running unchanged —
+without the flag, `PATCH /<app>/<coll>` remains the familiar *400 requires an item id*.
+Startup validation rejects `bulk = true` on any non-PATCH method.
+
+Semantics:
+
+* **Body** — exactly `{"filter": {...}, "set": {...}}`: any extra key, missing or empty
+  objects are a 400. An empty `filter` is refused on purpose: "all documents" exists only
+  as an explicit filter, never as an implicit default.
+* **Filter** — identical semantics to a list GET: equality plus `_min/_max/_gt/_lt`
+  ranges, allowlisted through `filter_fields` (which also declares the secondary indexes),
+  same limits (16 fields, 256 bytes per value, `[A-Za-z0-9_]` names). Values are pure
+  comparison data; JSON objects/arrays/null are a 400 instead of a silent empty match.
+* **`set`** — validated doc-independently and *partially* against the endpoint schema:
+  types and `allow_unknown_fields` apply, `required` does not (missing fields come from
+  the stored document, exactly like the single PATCH).
+* **All-or-nothing** — schema violations are answered 400 before a single document is
+  touched. Matching, merge and script evaluation then happen under one write-lock
+  acquisition; a script `throw` for *any* candidate aborts the whole request with 422 and
+  zero writes.
+* **Counters** — `matched` counts documents satisfying the filter at commit time
+  (no-ops included); `patched` counts documents actually rewritten. A no-op match
+  produces neither a write nor a WAL record.
+* **Isolation** — the whole mutation runs under a single write-lock acquisition, so a
+  concurrent single PATCH can never interleave halfway through a bulk run; it lands
+  completely before or completely after and is never lost. Readers are unaffected. Note
+  the flip side: the collection's writers wait for the entire pass — at the intended
+  scale (hundreds of documents) that is well under a second.
+* **Auth** — the bulk form inherits `auth_mode`/`roles` exactly like every other CRUD
+  endpoint; there is no new unauthenticated behavior.
+* **Durability** — each committed document is logged as one idempotent full-document
+  upsert; no new WAL op type. A restart replays into exactly the post-bulk state.
 
 ### Per-app user auth (`[auth]`, `/_auth/*`)
 

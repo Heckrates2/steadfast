@@ -193,6 +193,11 @@ struct EndpointRaw {
     roles: Option<Vec<String>>,
     paging_default: Option<usize>,
     filter_fields: Option<Vec<String>>,
+    /// `bulk = true` macht `PATCH /{app}/{collection}` (ohne Item-ID) zum
+    /// atomaren Sammel-Patch; `PATCH /{app}/{collection}/{id}` bleibt
+    /// unveraendert der Single-Doc-Patch desselben Endpunkts.
+    #[serde(default)]
+    bulk: bool,
     business_logic: Option<String>,
     #[serde(default)]
     schema: Option<SchemaRaw>,
@@ -234,6 +239,10 @@ pub struct EndpointRuntime {
     pub paging_default: usize,
     /// Optionale Allowlist filterbarer Felder.
     pub filter_fields: Option<Arc<[String]>>,
+    /// Sammel-Patch aktiviert: `PATCH /{app}/{collection}` (ohne Item-ID)
+    /// wendet `{"filter": ..., "set": ...}` atomar auf alle Treffer an.
+    /// Nur auf PATCH-Endpunkten zulaessig (Startfehler sonst).
+    pub bulk: bool,
     /// Vorkompiliertes Schema fuer Mutationen (POST/PUT/PATCH). `None` = keine
     /// Validierung konfiguriert — der Hot Path bleibt dann unangetastet.
     pub schema: Option<Arc<EndpointSchema>>,
@@ -568,6 +577,18 @@ fn validate_and_compile(
                 )));
             }
 
+            // `bulk = true` ist nur auf PATCH sinnvoll — der Sammel-Patch
+            // lebt im selben Endpunkt wie der Single-Doc-Patch (die Config
+            // kennt nur Kollektionspfade; (Pfad, Methode) ist eindeutig).
+            // Auf anderen Methoden waere das Flag toter Config-Code.
+            if raw_ep.bulk && method != HttpMethod::Patch {
+                return Err(EngineError::Config(format!(
+                    "app `{app_id}`, endpoint `{endpoint_name}`: bulk is only \
+                     supported on PATCH ({} dispatches by item id, not by collection)",
+                    method.as_str()
+                )));
+            }
+
             // Schema-Validierung ist nur fuer Body-tragende Mutationen
             // sinnvoll; auf GET/DELETE waere sie toter Config-Code —
             // lieber laut abweisen, als ein falsches Sicherheitsgefuehl
@@ -741,6 +762,7 @@ fn validate_and_compile(
                     roles,
                     paging_default,
                     filter_fields,
+                    bulk: raw_ep.bulk,
                     schema,
                     script,
                 }),
@@ -1413,6 +1435,46 @@ api_key_secret = "secret_secret_geheim"
 "#;
         let err = EngineConfig::from_toml(src).unwrap_err();
         assert!(err.message().contains("api_key_secret"), "{err}");
+    }
+
+    #[test]
+    fn bulk_flag_is_only_valid_on_patch() {
+        // Der Sammel-Patch lebt im selben Endpunkt wie der Single-Doc-Patch
+        // und dispatcht intern nach Item-ID — auf GET/POST/PUT/DELETE waere
+        // das Flag toter Config-Code, also Startfehler statt Stillschweigen.
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.bulk_get]
+  path = "/ledger"
+  method = "GET"
+  bulk = true
+  filter_fields = ["paid"]
+"#;
+        let err = EngineConfig::from_toml(src).unwrap_err();
+        assert!(err.message().contains("bulk"), "{err}");
+    }
+
+    #[test]
+    fn bulk_patch_endpoint_compiles_and_defaults_to_false() {
+        let src = r#"
+[apps.a]
+  [apps.a.endpoints.ledger_get]
+  path = "/ledger"
+  method = "GET"
+
+  [apps.a.endpoints.ledger_patch]
+  path = "/ledger"
+  method = "PATCH"
+  bulk = true
+  filter_fields = ["person", "paid"]
+"#;
+        let config = EngineConfig::from_toml(src).expect("bulk patch config must load");
+        let app = config.apps.get("a").unwrap();
+        assert!(app.endpoints.get("ledger_patch").unwrap().bulk);
+
+        // Ohne Flag bleibt alles beim Alten — Bestands-Configs (insb. der
+        // Single-Doc-Patch) laufen unveraendert weiter.
+        assert!(!app.endpoints.get("ledger_get").unwrap().bulk);
     }
 
     #[test]

@@ -21,8 +21,8 @@ mod wal;
 pub use cold::{ColdKey, ColdTier};
 pub use persist::{Persistence, PersistenceConfig};
 pub use store::{
-    CollectionDump, CreateConflict, ListParams, ListResult, MemoryStore, PatchOutcome, RangeOp,
-    SortSpec,
+    BulkPatchOutcome, BulkPatchReport, CollectionDump, CreateConflict, ListParams, ListResult,
+    MemoryStore, PatchOutcome, RangeOp, SortSpec,
 };
 // Encode-/Header-Helfer sind oeffentlich, damit Werkzeuge (Backups,
 // Migrationen) gueltige WAL-Segmente und Snapshots schreiben koennen.

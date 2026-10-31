@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use serde_json::json;
 use steadfast_storage::{
-    ColdTier, ListParams, MemoryStore, Persistence, PersistenceConfig, WAL_MAGIC, WalOp,
-    encode_wal_op, replay_data_dir, replay_data_dir_full, wal_file_path, write_file_header,
+    BulkPatchOutcome, ColdTier, ListParams, MemoryStore, Persistence, PersistenceConfig, WAL_MAGIC,
+    WalOp, encode_wal_op, replay_data_dir, replay_data_dir_full, wal_file_path, write_file_header,
     write_snapshot_file,
 };
 use tempfile::TempDir;
@@ -138,6 +138,67 @@ fn persistence_roundtrip_preserves_state_and_order() {
     assert_eq!(list_ids(&restored, "app", "tasks"), vec!["c", "a", "d"]);
     assert_eq!(restored.get("app", "tasks", "a").unwrap()["n"], json!("a2"));
     assert!(restored.get("app", "tasks", "b").is_none());
+}
+
+#[test]
+fn bulk_patch_survives_restart_via_wal() {
+    let dir = TempDir::new().unwrap();
+    let source = Arc::new(MemoryStore::new());
+    let persistence = Persistence::start(
+        &source,
+        persistence_cfg(dir.path(), Duration::ZERO),
+        Arc::new(ColdTier::new()),
+    )
+    .unwrap();
+
+    source.insert("app", "ledger", "a", json!({"person": "ann", "paid": true}));
+    source.insert("app", "ledger", "b", json!({"person": "bob", "paid": true}));
+    source.insert(
+        "app",
+        "ledger",
+        "c",
+        json!({"person": "cat", "paid": false}),
+    );
+
+    let outcome = source.patch_merge_bulk(
+        "app",
+        "ledger",
+        &[("paid".to_string(), "true".to_string())],
+        &[],
+        |mut current| {
+            if let serde_json::Value::Object(ref mut map) = current {
+                map.insert("paid".to_string(), json!(false));
+            }
+            Ok::<_, ()>(current)
+        },
+    );
+    let BulkPatchOutcome::Completed(report) = outcome else {
+        panic!("Sammel-Patch muss durchlaufen");
+    };
+    assert_eq!((report.matched, report.patched), (2, 2));
+    persistence.shutdown(&source).unwrap();
+
+    // Der Sammel-Patch erzeugt je committedem Dokument einen idempotenten
+    // Voll-Upsert: 3 Inserts + 2 Bulk-Commits, `c` bleibt unberuehrt. Der
+    // normale Replay-Pfad (kein eigener Op-Typ) muss den Zustand voll
+    // wiederherstellen.
+    let restored = MemoryStore::new();
+    let report = replay_data_dir(&restored, dir.path()).unwrap();
+    assert_eq!(report.wal_records, 5);
+    assert!(report.stopped_early.is_none());
+    assert_eq!(
+        restored.get("app", "ledger", "a").unwrap()["paid"],
+        json!(false)
+    );
+    assert_eq!(
+        restored.get("app", "ledger", "b").unwrap()["paid"],
+        json!(false)
+    );
+    assert_eq!(
+        restored.get("app", "ledger", "c").unwrap()["paid"],
+        json!(false),
+        "Nicht-Matcher bleibt unveraendert — auch nach dem Neustart"
+    );
 }
 
 #[test]

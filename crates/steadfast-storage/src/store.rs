@@ -190,6 +190,27 @@ pub enum PatchOutcome<E> {
     Updated(Arc<Value>),
 }
 
+/// Zaehler eines atomaren Sammel-Patches. `matched` zaehlt die Dokumente,
+/// die zum Commit-Zeitpunkt alle Filter erfuellen; `patched` die davon
+/// tatsaechlich neu geschriebenen — ein No-op-Merge (`set` enthaelt nur
+/// schon vorhandene Werte) wird nicht committet, daher kann `patched`
+/// unter `matched` liegen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkPatchReport {
+    pub matched: usize,
+    pub patched: usize,
+}
+
+/// Ergebnis von [`MemoryStore::patch_merge_bulk`].
+#[derive(Debug)]
+pub enum BulkPatchOutcome<E> {
+    /// Mindestens eine Transformation hat abgelehnt — NICHTS wurde
+    /// committet (All-or-Nothing), kein WAL-Op, keine neue seq.
+    Rejected(E),
+    /// Alle Transformationen akzeptiert; der Commit ist abgeschlossen.
+    Completed(BulkPatchReport),
+}
+
 /// Schemaloser In-Memory-Speicher. Klonbar (`Arc`-Semantik ueber DashMap)
 /// und von beliebig vielen Tokio-Workern gleichzeitig nutzbar. Mutationen
 /// werden zusaetzlich in die angehaengte WAL-Senke eingereiht (siehe
@@ -500,6 +521,134 @@ impl MemoryStore {
             doc: Arc::clone(&merged),
         });
         PatchOutcome::Updated(merged)
+    }
+
+    /// Atomarer Sammel-Patch: wendet `transform` (Shallow-Merge + Business-
+    /// Logik beim Aufrufer) auf ALLE Dokumente an, die `filters`/`ranges`
+    /// erfuellen — unter EINEM Schreib-Mutex-Acquisition. Ein nebenlaeufiger
+    /// Single-Patch auf ein Treffer-Dokument blockiert bis zum Commit des
+    /// Sammel-Patches und merged dann auf dessen neuem Stand; umgekehrt kann
+    /// der Sammel-Patch kein Dokument ueberschreiben, das der Single-Patch
+    /// committet hat. Nichts geht verloren.
+    ///
+    /// Zwei Phasen, damit die Deadlock-Regel des Moduls gilt (Kaltauflösung
+    /// niemals unter dem Schreib-Mutex — `resolve_payload` nimmt ihn fuer
+    /// Promotionen selbst): Phase 0 snapshottet die Kandidatenmenge
+    /// (Sekundaerindex bzw. `by_seq`-Read-Lock) und waermt alle Kalt-Payloads.
+    /// Phase A+B evaluiert unter der Sperre jeden Kandidaten FRISCH gegen die
+    /// Filter (zwischenzeitlich geaenderte Dokumente matchen nicht mehr),
+    /// wendet ALLE Transformationen an — die erste Ablehnung bricht ab,
+    /// bevor auch nur ein Commit passiert ist (All-or-Nothing) — und
+    /// committet dann in Kandidatenordnung (seq-aufsteigend, deterministisch
+    /// in neuen seqs und WAL-Ops).
+    ///
+    /// Die Kandidatenmenge ist ein Snapshot: Dokumente, die zwischen Snapshot
+    /// und Commit entstehen oder passend werden, gehoeren nicht dazu (dieselbe
+    /// Semantik wie die Index-Treffermenge von `list`). No-op-Merges werden
+    /// nicht committet; `patched` kann daher unter `matched` liegen.
+    pub fn patch_merge_bulk<E>(
+        &self,
+        app: &str,
+        collection: &str,
+        filters: &[(String, String)],
+        ranges: &[(String, RangeOp, String)],
+        transform: impl Fn(Value) -> Result<Value, E>,
+    ) -> BulkPatchOutcome<E> {
+        let Some(inner) = self.collection_for_read(app, collection) else {
+            return BulkPatchOutcome::Completed(BulkPatchReport {
+                matched: 0,
+                patched: 0,
+            });
+        };
+
+        // Phase 0: Kandidaten + Kaltauflösung — bewusst VOR dem Schreib-Mutex
+        // (resolve_payload nimmt ihn fuer Promotionen selbst).
+        let candidates: Vec<String> = match index_lookup(&inner, filters) {
+            Some(matched) => matched.into_iter().map(|(_, id)| id).collect(),
+            None => lock_seq_read(&inner.by_seq)
+                .values()
+                .map(|slot| slot.id.clone())
+                .collect(),
+        };
+        for id in &candidates {
+            self.resolve_payload(&inner, app, collection, id);
+        }
+
+        let _write = lock_write(&inner.write);
+        let mut matched = 0usize;
+        // Phase A: alle Transformationen auswerten, bevor der erste Commit
+        // passiert — die erste Ablehnung bricht ohne jede Aenderung ab.
+        let mut staged: Vec<(String, u64, Arc<Value>, Arc<Value>)> = Vec::new();
+        for id in &candidates {
+            let (old_seq, current) = {
+                let Some(slot) = inner.by_id.get(id) else {
+                    continue; // zwischenzeitlich geloescht
+                };
+                let Some(current) = slot.data.as_ref().map(Arc::clone) else {
+                    continue; // unlesbarer Kaltstand: wie list ueberspringen
+                };
+                (slot.seq, current)
+            };
+            if !filters
+                .iter()
+                .all(|(field, raw)| value_matches(&current, field, raw))
+                || !ranges
+                    .iter()
+                    .all(|(field, op, raw)| value_in_range(&current, field, *op, raw))
+            {
+                continue;
+            }
+            let mut merged = match transform((*current).clone()) {
+                Ok(doc) => doc,
+                Err(err) => return BulkPatchOutcome::Rejected(err),
+            };
+            if let Value::Object(map) = &mut merged {
+                map.insert("id".to_string(), Value::String(id.to_string()));
+            }
+            matched += 1;
+            if merged == *current {
+                continue; // No-op: kein Commit, kein WAL-Op, keine neue seq
+            }
+            staged.push((id.clone(), old_seq, current, Arc::new(merged)));
+        }
+
+        // Phase B: committen — dieselben Invarianten wie `patch_merge`, nur
+        // sequenziell ueber die gesamte Treffermenge unter derselben Sperre.
+        let mut patched = 0usize;
+        for (id, old_seq, current, merged) in staged {
+            let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut slot = inner
+                    .by_id
+                    .get_mut(&id)
+                    .expect("Eintrag verschwand unter dem Schreib-Mutex");
+                slot.seq = seq;
+                slot.data = Some(Arc::clone(&merged));
+                slot.access.store(self.tick(), Ordering::Relaxed);
+            }
+            let fields = declared_fields(&inner);
+            {
+                let mut order = lock_seq_write(&inner.by_seq);
+                order.remove(&old_seq);
+                order.insert(
+                    seq,
+                    SeqSlot {
+                        id: id.clone(),
+                        doc: Some(Arc::clone(&merged)),
+                    },
+                );
+            }
+            index_remove(&inner, fields.as_ref(), old_seq, &current);
+            index_add(&inner, fields.as_ref(), seq, &id, &merged);
+            self.log_wal(WalOp::Upsert {
+                app: app.to_string(),
+                collection: collection.to_string(),
+                id,
+                doc: merged,
+            });
+            patched += 1;
+        }
+        BulkPatchOutcome::Completed(BulkPatchReport { matched, patched })
     }
 
     /// Gepingerte, gefilterte, optional sortierte Liste. Filter sind reine
@@ -1472,6 +1621,265 @@ mod tests {
             s.patch_merge("other-app", "tasks", "t1", |_| Ok::<_, ()>(json!({}))),
             PatchOutcome::NotFound
         ));
+    }
+
+    // --- Sammel-Patch (patch_merge_bulk) ----------------------------------------
+
+    /// Transform, der `feld = wert` flach ins Dokument setzt (dieselbe
+    /// Merge-Semantik wie der Handler, hier ohne Script).
+    fn set_field(field: &str, value: Value) -> impl Fn(Value) -> Result<Value, String> {
+        let field = field.to_string();
+        move |mut current| {
+            if let Value::Object(ref mut map) = current {
+                map.insert(field.clone(), value.clone());
+            }
+            Ok(current)
+        }
+    }
+
+    fn filters(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(field, raw)| (field.to_string(), raw.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn bulk_patch_updates_all_matches_and_reports_counters() {
+        let s = store();
+        s.insert("app", "ledger", "a", json!({"person": "ann", "paid": true}));
+        s.insert("app", "ledger", "b", json!({"person": "bob", "paid": true}));
+        s.insert("app", "ledger", "c", json!({"person": "ann", "paid": true}));
+
+        let outcome = s.patch_merge_bulk(
+            "app",
+            "ledger",
+            &filters(&[("person", "ann")]),
+            &[],
+            set_field("paid", json!(false)),
+        );
+        let BulkPatchOutcome::Completed(report) = outcome else {
+            panic!("Sammel-Patch muss durchlaufen");
+        };
+        assert_eq!(report.matched, 2);
+        assert_eq!(report.patched, 2);
+
+        assert_eq!(s.get("app", "ledger", "a").unwrap()["paid"], json!(false));
+        assert_eq!(
+            s.get("app", "ledger", "b").unwrap()["paid"],
+            json!(true),
+            "Nicht-Matcher bleibt unberuehrt"
+        );
+        assert_eq!(s.get("app", "ledger", "c").unwrap()["paid"], json!(false));
+    }
+
+    #[test]
+    fn bulk_patch_counts_noops_and_empty_matches() {
+        let s = store();
+        s.insert("app", "ledger", "a", json!({"amount": 50, "paid": true}));
+        s.insert("app", "ledger", "b", json!({"amount": 150, "paid": true}));
+        s.insert("app", "ledger", "c", json!({"amount": 200, "paid": false}));
+
+        // Bereich amount_min=100: b und c matchen; b aendert sich, c ist
+        // bereits im Zielzustand (No-op — zaehlt als matched, wird aber
+        // nicht neu geschrieben und erzeugt keinen WAL-Op).
+        let ranges = vec![("amount".to_string(), RangeOp::Gte, "100".to_string())];
+        let outcome = s.patch_merge_bulk(
+            "app",
+            "ledger",
+            &[],
+            &ranges,
+            set_field("paid", json!(false)),
+        );
+        let BulkPatchOutcome::Completed(report) = outcome else {
+            panic!("Sammel-Patch muss durchlaufen");
+        };
+        assert_eq!(report.matched, 2);
+        assert_eq!(report.patched, 1, "No-op-Matches werden nicht committet");
+
+        // Filter ohne Treffer: 0/0 statt Fehler — auch fuer unbekannte
+        // Kollektionen (die Engine kennt den Bestand nicht vorab).
+        for (app, collection, filter) in [
+            ("app", "ledger", filters(&[("person", "niemand")])),
+            ("app", "fehlt", filters(&[("paid", "true")])),
+        ] {
+            let outcome = s.patch_merge_bulk(
+                app,
+                collection,
+                &filter,
+                &[],
+                set_field("paid", json!(false)),
+            );
+            let BulkPatchOutcome::Completed(report) = outcome else {
+                panic!("Sammel-Patch muss durchlaufen");
+            };
+            assert_eq!((report.matched, report.patched), (0, 0));
+        }
+    }
+
+    #[test]
+    fn bulk_patch_rejection_commits_nothing() {
+        let s = store();
+        s.insert("app", "ledger", "a", json!({"person": "ann", "paid": true}));
+        s.insert(
+            "app",
+            "ledger",
+            "b",
+            json!({"person": "boom", "paid": true}),
+        );
+        s.insert("app", "ledger", "c", json!({"person": "cat", "paid": true}));
+
+        // Phase A wertet ALLE Transformationen aus, bevor der erste Commit
+        // passiert — ein Fehler bei `b` muss a und c unberuehrt lassen.
+        let outcome = s.patch_merge_bulk(
+            "app",
+            "ledger",
+            &filters(&[("paid", "true")]),
+            &[],
+            |current| {
+                if current["person"] == json!("boom") {
+                    Err("abgelehnt".to_string())
+                } else {
+                    set_field("paid", json!(false))(current)
+                }
+            },
+        );
+        assert!(matches!(
+            outcome,
+            BulkPatchOutcome::Rejected(err) if err == "abgelehnt"
+        ));
+
+        for id in ["a", "b", "c"] {
+            assert_eq!(
+                s.get("app", "ledger", id).unwrap()["paid"],
+                json!(true),
+                "{id} darf vom abgebrochenen Sammel-Patch nichts sehen"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_patch_keeps_secondary_indexes_consistent() {
+        let s = store();
+        s.insert("app", "ledger", "a", json!({"person": "ann", "paid": true}));
+        s.insert("app", "ledger", "b", json!({"person": "bob", "paid": true}));
+        s.insert(
+            "app",
+            "ledger",
+            "c",
+            json!({"person": "cat", "paid": false}),
+        );
+        s.declare_indexes("app", "ledger", &["paid".to_string(), "person".to_string()]);
+
+        let outcome = s.patch_merge_bulk(
+            "app",
+            "ledger",
+            &filters(&[("paid", "true")]),
+            &[],
+            set_field("paid", json!(false)),
+        );
+        let BulkPatchOutcome::Completed(report) = outcome else {
+            panic!("Sammel-Patch muss durchlaufen");
+        };
+        assert_eq!((report.matched, report.patched), (2, 2));
+
+        // Die gefilterte Liste laeuft nach der Deklaration ausschliesslich
+        // ueber den Sekundaerindex (ohne Re-Check der Dokumente) — ein
+        // Geistereintrag unter b:true oder ein fehlender unter b:false
+        // wuerde hier sofort sichtbar.
+        let paid_true = s.list(
+            "app",
+            "ledger",
+            ListParams {
+                page: 1,
+                limit: 10,
+                filters: filters(&[("paid", "true")]),
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
+        assert_eq!(paid_true.total, 0, "b:true muss leer sein");
+        let paid_false = s.list(
+            "app",
+            "ledger",
+            ListParams {
+                page: 1,
+                limit: 10,
+                filters: filters(&[("paid", "false")]),
+                ranges: Vec::new(),
+                sort: None,
+            },
+        );
+        assert_eq!(paid_false.total, 3, "alle drei unter b:false");
+    }
+
+    #[test]
+    fn bulk_patch_and_concurrent_single_patch_do_not_lose_updates() {
+        use std::time::Duration;
+        let s = Arc::new(store());
+        s.insert(
+            "app",
+            "ledger",
+            "t1",
+            json!({"person": "ann", "paid": true, "note": ""}),
+        );
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        // Der Sammel-Patch signalisiert aus seiner Transformation heraus —
+        // die laeuft UNTER dem Schreib-Mutex. Der daneben gestartete
+        // Single-Patch kann daher nur vor Phase 0 oder nach dem Commit
+        // ansetzen; zwischen Lesen und Schreiben des Sammel-Patches gibt es
+        // keinen Platz fuer ihn.
+        let s_bulk = Arc::clone(&s);
+        let bulk = std::thread::spawn(move || {
+            let outcome = s_bulk.patch_merge_bulk(
+                "app",
+                "ledger",
+                &filters(&[("paid", "true")]),
+                &[],
+                |mut current| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    if let Value::Object(ref mut map) = current {
+                        map.insert("paid".to_string(), json!(false));
+                    }
+                    Ok::<_, ()>(current)
+                },
+            );
+            assert!(matches!(outcome, BulkPatchOutcome::Completed(_)));
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Sammel-Patch muss den Schreib-Mutex halten");
+
+        let s_single = Arc::clone(&s);
+        let single = std::thread::spawn(move || {
+            let outcome = s_single.patch_merge("app", "ledger", "t1", |mut current| {
+                if let Value::Object(ref mut map) = current {
+                    map.insert("note".to_string(), json!("single"));
+                }
+                Ok::<_, ()>(current)
+            });
+            assert!(matches!(outcome, PatchOutcome::Updated(_)));
+        });
+
+        // Erst jetzt darf der Sammel-Patch weiterlaufen — der Single-Patch
+        // ist entweder schon am Mutex oder kommt gleich an; beide Reihen-
+        // folgen enden im selben Ergebnis (Single-Patch liest erst UNTER
+        // dem Mutex).
+        release_tx.send(()).unwrap();
+        bulk.join().unwrap();
+        single.join().unwrap();
+
+        let doc = s.get("app", "ledger", "t1").unwrap();
+        assert_eq!(doc["paid"], json!(false), "Bulk-Effekt muss ueberleben");
+        assert_eq!(
+            doc["note"],
+            json!("single"),
+            "Single-Patch muss auf dem Bulk-Stand aufsetzen, nicht verlieren"
+        );
     }
 
     #[test]

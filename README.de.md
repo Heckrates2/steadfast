@@ -258,6 +258,7 @@ Gateway-Trust-Boundary für Maschinendatenverkehr (wohin TLS und Edge-Rate-Limit
 | `endpoints.<name>.roles` | Endpunkt | Optionale Rollen-Allowlist (nur mit `auth_mode = "jwt"`): die *aktuelle* Rolle des Benutzers muss passen, sonst 403. Fehlt = jeder authentifizierte Benutzer der App |
 | `endpoints.<name>.paging_default` | Endpunkt | Standardseitengröße für Listen-GETs (1..=100, Standard 20) |
 | `endpoints.<name>.filter_fields` | Endpunkt | Optionale Allowlist filterbarer/sortierbarer Felder — Security-Allowlist **und** Index-Schalter |
+| `endpoints.<name>.bulk` | Endpunkt | `true` an einem `PATCH`-Endpunkt: die ID-lose Form `PATCH /<app>/<coll>` wird zum atomaren Sammel-Patch (`{"filter": {...}, "set": {...}}` → `200 {"matched": n, "patched": m}`); `PATCH /<app>/<coll>/{id}` bleibt der gewohnte Einzel-Merge. Wird beim Start an jeder Nicht-PATCH-Methode abgelehnt — siehe [Sammel-Patch](#sammel-patch-bulk--true) |
 | `endpoints.<name>.business_logic` | Endpunkt | Rhai-Skript mit Hook `fn on_request(payload, user)`; läuft vor dem Storage bei POST/PUT/PATCH; `throw` → 422 |
 | `endpoints.<name>.schema` | Endpunkt | Optionale Validierung für POST/PUT/PATCH. `required = [...]` (erzwungen bei POST/PUT; PATCH ist partiell), `allow_unknown_fields` (Standard `false` — nicht deklarierte Felder werden abgelehnt), `schema.types.<field> = "string" \| "number" \| "boolean" \| "object" \| "array" \| "null" \| "date" (strikt `YYYY-MM-DD`, inkl. Schaltjahre) \| "datetime" (RFC 3339 — Zeitzone `Z`/`±HH:MM` ist Pflicht)`. Ungültige Typ-Strings oder Feldnamen brechen den Start ab |
 
@@ -293,6 +294,9 @@ Browser-Code ihn lesen kann.
 * `PUT /<app>/<coll>/{id}` — komplettes Ersetzen, `id` wird aus dem Pfad erzwungen.
 * `PATCH /<app>/<coll>/{id}` — shallow merge + Skript, atomar unter dem Write-Lock der Kollektion
   (keine Lost Updates; ein Skript-`throw` committet nichts).
+* `PATCH /<app>/<coll>` — mit `bulk = true`: der atomare Sammel-Patch (siehe
+  [unten](#sammel-patch-bulk--true)); ohne das Flag bleibt es die gewohnte
+  400 „erfordert eine Item-ID".
 * `DELETE /<app>/<coll>/{id}` — `204`.
 
 Listen-Queries: reservierte Parameter sind `page`, `limit`, `sort`, `order`. `field=value` ist ein
@@ -311,6 +315,76 @@ deklariertes Schema verfehlt · 405 (+ `Allow`) nicht konfigurierte Methode · 4
 User-Metadaten für Skripte kommen aus `X-User-Id` / `X-User-Role` (Standard `anonymous` / `user`).
 Setze `ENGINE_GATEWAY_SECRET`, und diese Header zählen nur, wenn der Request die
 Gateway-Provenienz per `X-Internal-Auth` nachweist — direkte Clients können keine Rollen fälschen.
+
+### Sammel-Patch (`bulk = true`)
+
+`bulk = true` an einem `PATCH`-Endpunkt aktiviert den atomaren Kollektions-PATCH — ein
+Request, der alle passenden Dokumente auf einmal umschreibt (die „Monat zurücksetzen“-
+Operation, die sonst eine Kette einzelner PATCHes wäre, die auf einer wackeligen Verbindung
+halb abreißen kann):
+
+```toml
+[apps.ledger.endpoints.ledger_patch]
+path = "/ledger"
+method = "PATCH"
+auth_mode = "jwt"
+bulk = true              # PATCH /ledger        -> Sammel-Patch
+filter_fields = ["person", "paid"]
+
+  [apps.ledger.endpoints.ledger_patch.schema]
+  allow_unknown_fields = false
+
+    [apps.ledger.endpoints.ledger_patch.schema.types]
+    person = "string"
+    paid = "boolean"
+```
+
+```bash
+curl -X PATCH https://host/myapp/ledger \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"filter": {"paid": true}, "set": {"paid": false}}'
+# -> 200 {"matched": 14, "patched": 14}
+```
+
+**Design-Entscheidung — ein Flag, keine zweite Route**: `bulk = true` erweitert den
+bestehenden PATCH-Endpunkt, statt eine parallele Bulk-Route (z. B. `POST /coll/_bulk`)
+einzuführen. Die Routing-Invariante der Engine ist bereits ein Endpunkt je
+`(Pfad, Methode)`, und derselbe Endpunkt bedient beide Formen: mit Item-ID ist der Request
+der gewohnte Einzel-Merge, ohne ID der Sammel-Patch. Bestehende Konfigurationen laufen
+unverändert weiter — ohne das Flag bleibt `PATCH /<app>/<coll>` die gewohnte
+*400 erfordert eine Item-ID*. Die Startup-Validierung lehnt `bulk = true` an jeder
+Nicht-PATCH-Methode ab.
+
+Semantik:
+
+* **Body** — exakt `{"filter": {...}, "set": {...}}`: jeder zusätzliche Schlüssel, fehlende
+  oder leere Objekte sind ein 400. Ein leerer `filter` wird bewusst abgelehnt: „alle
+  Dokumente“ gibt es nur als expliziten Filter, nie als implizites Default.
+* **Filter** — identische Semantik wie das Listen-GET: Gleichheit plus
+  `_min/_max/_gt/_lt`-Bereiche, Allowlist über `filter_fields` (deklariert zugleich die
+  Sekundärindizes), dieselben Grenzen (16 Felder, 256 Bytes je Wert,
+  `[A-Za-z0-9_]`-Namen). Werte sind reine Vergleichsdaten; JSON-Objekte/Arrays/null sind
+  ein 400 statt eines stillen Leer-Match.
+* **`set`** — dokumentenunabhängig und *partiell* gegen das Endpunkt-Schema validiert:
+  Typen und `allow_unknown_fields` gelten, `required` nicht (fehlende Felder kommen aus dem
+  gespeicherten Dokument, genau wie beim Einzel-PATCH).
+* **All-or-nothing** — Schema-Verletzungen werden mit 400 beantwortet, bevor ein einziges
+  Dokument angefasst wird. Matching, Merge und Skript laufen dann unter EINER
+  Write-Lock-Annahme; ein Skript-`throw` für *irgendeinen* Treffer bricht den gesamten
+  Request mit 422 und null Schreibvorgängen ab.
+* **Zähler** — `matched` zählt die Dokumente, die den Filter zum Commit-Zeitpunkt erfüllen
+  (No-ops eingerechnet); `patched` zählt die tatsächlich neu geschriebenen. Ein No-op-Treffer
+  erzeugt weder Schreibvorgang noch WAL-Record.
+* **Isolation** — die gesamte Mutation läuft unter einer einzigen Write-Lock-Annahme: Ein
+  gleichzeitiger Einzel-PATCH kann sich nie mitten in den Sammel-Lauf einschieben; er landet
+  komplett davor oder komplett danach und geht nie verloren. Leser sind nicht betroffen. Die
+  Kehrseite: Schreiber der Kollektion warten den ganzen Lauf ab — bei der intendierten
+  Größenordnung (hunderte Dokumente) deutlich unter einer Sekunde.
+* **Auth** — die Sammelform erbt `auth_mode`/`roles` exakt wie jeder andere CRUD-Endpunkt;
+  es gibt kein neues unauthentifiziertes Verhalten.
+* **Haltbarkeit** — je committetem Dokument wird ein idempotenter Voll-Dokument-Upsert
+  geloggt; kein neuer WAL-Op-Typ. Ein Neustart replays exakt in den Zustand nach dem
+  Sammel-Patch.
 
 ### Benutzer-Auth pro App (`[auth]`, `/_auth/*`)
 
